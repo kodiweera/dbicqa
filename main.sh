@@ -5,7 +5,7 @@
 
 # results is the output directory inside the qadata forlder
 
-singularity run --cleanenv --bind data/ containers/fbirnqa-1.11.14.sif data/$1/$2 /data/$1/$2/results
+singularity run --cleanenv --bind data/ containers/fbirnqa-1.11.14.sif data/$1/$2 data/$1/$2/results
 
 
 python fbirnpdf/qapdf.py data/$1/$2/results/ $1
