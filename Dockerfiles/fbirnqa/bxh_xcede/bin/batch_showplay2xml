@@ -1,0 +1,51 @@
+#!/usr/bin/perl -w
+
+# $Id: batch_showplay2xml,v 1.5 2007-10-09 20:04:15 gadde Exp $
+
+use strict;
+use File::Spec;
+use Config;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use BXHPerlUtils;
+
+my $progshowplay2xml = findexecutable("showplay2xml");
+if (!defined($progshowplay2xml)) {
+  print STDERR "Can't find program showplay2xml!\n";
+  exit -1;
+}
+
+if (scalar(@ARGV) == 0 || grep { $_ =~ /^--help$/ } @ARGV) {
+  die <<EOM
+Usage:
+  batch_showplay2xml pdigmfiles...
+
+This program runs showplay2xml on each pdigm file given as an argument.
+If the input file name is called pdigm1, then the output file will
+be called events-pdigm1.xml.
+EOM
+}
+
+while (scalar(@ARGV) > 0) {
+  my $path = shift @ARGV;
+  my ($vol, $dirs, $file) = File::Spec->splitpath($path);
+  my $newfile = "events-${file}.xml";
+  my $newpath = File::Spec->catpath($vol, $dirs, $newfile);
+  system($progshowplay2xml, '--overwrite', $path, $newpath);
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.4  2005/09/20 18:37:54  gadde
+# Updates to versioning, help and documentation, and dependency checking
+#
+# Revision 1.3  2005/09/19 16:31:55  gadde
+# Documentation and help message updates.
+#
+# Revision 1.2  2005/04/05 13:37:57  gadde
+# Add --overwrite flag.
+#
+# Revision 1.1  2005/04/05 13:29:04  gadde
+# Add batch_showplay2xml.
+#

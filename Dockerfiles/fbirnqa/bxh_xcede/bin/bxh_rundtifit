@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use BXHPerlUtils;
+
+my $starttime = time();
+
+# This script takes an input diffusion image and runs FSL's dtifit on it.
+# Thanks to Chris Petty for the workflow.
+
+my $progdiffdirs;
+my $progbxhreorient;
+my $progbxh2analyze;
+my $proganalyze2bxh;
+my $progbet;
+my $progeddy;
+my $progselect;
+my $progdtifit;
+my $progbxhmerge;
+my $progextracteddymat;
+my $progapplytransform;
+
+my %exechash =
+  (
+   'extractdiffdirs' => \$progdiffdirs,
+   'bxhreorient' => \$progbxhreorient,
+   'bxh2analyze' => \$progbxh2analyze,
+   'analyze2bxh' => \$proganalyze2bxh,
+   'bet' => \$progbet,
+   'eddy_correct' => \$progeddy,
+   'bxhselect' => \$progselect,
+   'dtifit' => \$progdtifit,
+   'bxh_merge' => \$progbxhmerge,
+   'extract_eddy_mat' => \$progextracteddymat,
+   'bxh_applytransform' => \$progapplytransform,
+  );
+foreach my $execname (keys %exechash) {
+  ${$exechash{$execname}} = findexecutable($execname);
+}
+foreach my $execname (keys %exechash) {
+  if (!defined(${$exechash{$execname}})) {
+    print STDERR "Can't find required executable \"$execname\"!\n";
+    exit -1;
+  }
+}
+
+if (scalar(@ARGV) != 2) {
+  print STDERR <<EOM;
+ERROR: two arguments required: inputfile outputprefix"
+inputfile is a diffusion image in .bxh or XCEDE format."
+All output filenames will start with outputprefix.  outputprefix may"
+contain directory names.  If outputprefix is an existing directory,"
+files will be written to that directory."
+EOM
+  exit -1;
+}
+
+my $inputfile = shift;
+my $outputprefix = shift;
+if (-d $outputprefix || $outputprefix =~ m%/$%) {
+  mkdir $outputprefix;
+  $outputprefix = "${outputprefix}/";
+} else {
+  $outputprefix = "${outputprefix}_";
+}
+
+my $logfh = undef;
+open($logfh, '>', "${outputprefix}LOG.txt") || die "Error opening '${outputprefix}LOG.txt' for writing: $!\n";
+
+print $logfh "START: ", scalar(localtime($starttime)), "\n";
+
+#### converts dti and orient as LAS ####
+
+unlink glob("${outputprefix}tmp.*");
+run_cmd([$logfh], $progbxhreorient, '--orientation=LAS', $inputfile, "${outputprefix}tmp.bxh");
+unlink glob("${outputprefix}dti*");
+run_cmd([$logfh], $progbxh2analyze, '-s', '--niigz', "${outputprefix}tmp.bxh", "${outputprefix}dti");
+
+#### skull strip the dti
+run_cmd([$logfh], $progbet, "${outputprefix}dti", "${outputprefix}dti_brain", '-F', '-f', '.25');
+
+print $logfh "Removing '${outputprefix}dti.bxh'\n";
+unlink glob("${outputprefix}dti.bxh");
+print $logfh "Removing '${outputprefix}dti.nii.gz'\n";
+unlink glob("${outputprefix}dti.nii.gz");
+
+#### eddy current correction
+unlink glob("${outputprefix}data_tmp.ecclog");
+run_cmd([$logfh], $progeddy, "${outputprefix}dti_brain", "${outputprefix}data_tmp", '0');
+unlink "${outputprefix}data_tmp.bxh";
+run_cmd([$logfh], $proganalyze2bxh, "${outputprefix}data_tmp.nii.gz", "${outputprefix}data_tmp.bxh");
+# make sure diffusion direction dimension gets labeled correctly (assuming original data had it labeled correctly)
+run_cmd([$logfh], $progbxhmerge, '--forcecopylist', 'datarec.dimension.type', "${outputprefix}tmp.bxh", "${outputprefix}data_tmp.bxh", "${outputprefix}data_tmp2.bxh");
+print $logfh "Removing '${outputprefix}tmp.*'\n";
+unlink glob("${outputprefix}tmp.*");
+print $logfh "Renaming '${outputprefix}data_tmp2.bxh' to '${outputprefix}data_tmp.bxh'\n";
+unlink "${outputprefix}data_tmp.bxh";
+rename("${outputprefix}data_tmp2.bxh", "${outputprefix}data_tmp.bxh");
+print $logfh "Removing '${outputprefix}data.*'\n";
+unlink glob("${outputprefix}data.*");
+print $logfh "Fixing diffusion directions in eddy-corrected data\n";
+run_cmd([$logfh], $progextracteddymat, '--rotation', "${outputprefix}data_tmp.ecclog", "${outputprefix}rotmat");
+run_cmd([$logfh], $progapplytransform, '--refvol', "${outputprefix}data_tmp.bxh", '--copydata', "${outputprefix}data_tmp.bxh", glob("${outputprefix}rotmat*.mat"), "${outputprefix}data.bxh");
+print $logfh "Removing '${outputprefix}rotmat*.mat'\n";
+unlink glob("${outputprefix}rotmat*.mat");
+print $logfh "Renaming '${outputprefix}data_tmp.ecclog' to '${outputprefix}data.ecclog'\n";
+rename("${outputprefix}data_tmp.ecclog", "${outputprefix}data.ecclog");
+print $logfh "Removing '${outputprefix}data_tmp.nii.gz'\n";
+unlink "${outputprefix}data_tmp.nii.gz";
+print $logfh "Removing '${outputprefix}data_tmp.bxh'\n";
+unlink "${outputprefix}data_tmp.bxh";
+print $logfh "Removing '${outputprefix}dti_brain.nii.gz'\n";
+unlink "${outputprefix}dti_brain.nii.gz";
+print $logfh "Renaming '${outputprefix}dti_brain_mask.nii.gz' to '${outputprefix}nodif_brain_mask.nii.gz'\n";
+rename "${outputprefix}dti_brain_mask.nii.gz", "${outputprefix}nodif_brain_mask.nii.gz";
+run_cmd([$logfh], $progselect, '--timeselect', '0', "${outputprefix}data.bxh", "${outputprefix}nodif_brain.bxh");
+print $logfh "Removing '${outputprefix}tmp.*'\n";
+unlink glob("${outputprefix}tmp*");
+
+#### grab correct gradient directions from reoriented and eddy-corrected
+###  volumes (since FSL expects gradient directions to be in image space,
+###  doing it before this won't work).
+run_cmd([$logfh], $progdiffdirs, '--overwrite', '--fsl', "${outputprefix}data.bxh", "${outputprefix}bvecs", "${outputprefix}bvals");
+
+##run dtifit
+run_cmd([$logfh], $progdtifit, '-k', "${outputprefix}data", '-m', "${outputprefix}nodif_brain_mask", '-o', "${outputprefix}dti", '-r', "${outputprefix}bvecs", '-b', "${outputprefix}bvals");
+
+for my $img ('FA', 'S0', 'MO', 'V1', 'V2', 'V3', 'L1', 'L2', 'L3', 'MD') {
+  unlink "${outputprefix}dti_${img}.bxh";
+  run_cmd([$logfh], $proganalyze2bxh, "${outputprefix}dti_${img}.nii.gz", "${outputprefix}dti_${img}.bxh");
+}
+for my $img ('nodif_brain_mask') {
+  unlink "${outputprefix}${img}.bxh";
+  run_cmd([$logfh], $proganalyze2bxh, "${outputprefix}${img}.nii.gz", "${outputprefix}${img}.bxh");
+}
+
+my $endtime = time();
+print $logfh "END: ", scalar(localtime($endtime)), "\n";
+
+my $runtime = $endtime - $starttime;
+my $runsecs = $runtime % 60;
+my $runmins = int($runtime / 60) % 60;
+my $runhours = int($runtime / (60 * 60));
+print $logfh "Run time: ${runhours}h ${runmins}m ${runsecs}s\n";
+
+close $logfh;
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.2  2009/04/09 15:51:34  gadde
+# Move extraction of diffusion directions to *after* reorient!
+#
+# Revision 1.1  2009/04/08 16:34:37  gadde
+# Initial import.
+#

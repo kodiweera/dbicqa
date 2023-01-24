@@ -1,0 +1,328 @@
+#!/usr/bin/env perl
+
+my $rcsid = '$Id: bxh_eventstats_standardize,v 1.8 2007-12-19 22:19:43 gadde Exp $ ';
+
+use strict;
+
+use File::Spec;
+use File::Path;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use File::Copy;
+
+use BXHPerlUtils;
+
+# extract the original command line from the log file.
+# Each argument (or option plus argument) gets put in a separate list,
+# and an array of references to these lists are returned.
+sub read_cmd_line_from_log {
+  my @cmdline = ();
+  my ($logfile,) = @_;
+  open(FH, $logfile) || die "Error opening '$logfile': $!\n";
+  my $foundbegin = 0;
+  while (<FH>) {
+    /^Command line \(unquoted\) BEGIN$/ && do { $foundbegin = 1; last };
+  }
+  if (!$foundbegin) {
+    die "Didn't find command-line in log file '$logfile'\n";
+  }
+  while (<FH>) {
+    chomp;
+    last if /^Command line \(unquoted\) END$/;
+    my ($arg, undef, $optarg) = /^ ([^ ]*)( (.*))?$/;
+    push @cmdline, [$arg, defined($optarg) ? $optarg : ()];
+  }
+  close FH;
+  return @cmdline;
+}
+
+my $opt_refvol = 'func';
+my $opt_updateonly = 0;
+
+my $usage = <<EOM;
+Usage:
+  bxh_eventstats_standardize [opts] eventstatsprefixes...
+
+This program standardizes the outputs of one or more runs of bxh_eventstats.
+Each output is specified by the prefix used as the base name for the output
+files written by bxh_eventstats.  These prefixes should include a directory
+path if the files are not in the current directory.  The inputs to all
+specified runs of bxh_eventstats must have been FSL/FEAT analyses.  All
+of the bxh_eventstats output files are transformed to the same standard brain
+used in the FEAT analysis of that data.  The output data will be in compressed
+NIfTI-1 format, wrapped with .bxh files, and will be named the same as the
+original files, except that the prefix will be extended with "_standardized".
+
+Options:
+  --refvol <string>
+  --refvol=<string>
+        This option specifies the reference volume to use to determine the
+        resolution and voxel spacing of the outputs.  This must refer to one
+        of the reference volume headers copied by bxh_eventstats, typically
+        "func" (default), "highres", or "standard", or must be a path to a
+        ANALYZE or NIFTI reference volume (with or without extension).
+  --updateonly
+        If specified, existing standardized files are recreated only if the
+        input data is newer.  Standardized files that are newer than their
+        input data are considered up to date and are skipped.
+EOM
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+my @optdata = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    push @optdata, ["--"];
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)(.*))?$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  my $usedoptarg = 0;
+  if ($opt eq 'help') {
+    print STDERR $usage;
+    exit(-1);
+  } elsif ($opt eq 'refvol' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_refvol = $optarg;
+  } elsif ($opt eq 'updateonly') {
+    $opt_updateonly++;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+  push @optdata, ["--" . $opt, $usedoptarg ? $optarg : ()];
+}
+
+my $proganalyze2bxh = findexecutable("analyze2bxh");
+my $progbxh2analyze = findexecutable("bxh2analyze");
+my $progavwhd = findexecutable("avwhd");
+my $progavworient = findexecutable("avworient");
+my $progavwswapdim = findexecutable("avwswapdim");
+my $progavwcreatehd = findexecutable("avwcreatehd");
+$progavwhd = findexecutable("fslhd") if (!defined($progavwhd));
+$progavworient = findexecutable("fslorient") if (!defined($progavworient));
+$progavwswapdim = findexecutable("fslswapdim") if (!defined($progavwswapdim));
+$progavwcreatehd = findexecutable("fslcreatehd") if (!defined($progavwcreatehd));
+my $progflirt = findexecutable("flirt");
+if (!defined($proganalyze2bxh)) {
+  print STDERR "Can't find program analyze2bxh!\n";
+  exit -1;
+}
+if (!defined($progbxh2analyze)) {
+  print STDERR "Can't find program bxh2analyze!\n";
+  exit -1;
+}
+if (!defined($progavwhd)) {
+  print STDERR "Can't find program avwhd/fslhd!\n";
+  exit -1;
+}
+if (!defined($progavwcreatehd)) {
+  print STDERR "Can't find program avwcreatehd/fslcreatehd!\n";
+  exit -1;
+}
+if (!defined($progavworient)) {
+  print STDERR "Can't find program avworient/fslorient!\n";
+  exit -1;
+}
+if (!defined($progavwswapdim)) {
+  print STDERR "Can't find program avwswapdim/fslswapdim!\n";
+  exit -1;
+}
+if (!defined($progflirt)) {
+  print STDERR "Can't find program flirt!\n";
+  exit -1;
+}
+
+my @prefixes = @ARGV;
+my @newprefixes = map { $_ . '_standardized' } @prefixes;
+
+my @cmdlineargs = map { [read_cmd_line_from_log($_ . '_LOG.txt')] } @ARGV;
+
+my @querylabels = map {
+  my @cmdline = @$_;
+  my @labels = map { $_->[1] } grep { $_->[0] eq '--querylabel' } @cmdline;
+  if (scalar(@labels) == 0) {
+    my $numqueries = grep { $_->[0] eq '--query' } @cmdline;
+    @labels = map { sprintf("%03d",$_) } (0..$numqueries-1);
+  }
+  \@labels;
+} @cmdlineargs;
+
+my @didbrainmask = map {
+  scalar(grep { $_->[0] eq '--createbrainmask' } @$_) > 0
+} @cmdlineargs;
+
+my @didtmaps = map {
+  scalar(grep { $_->[0] eq '--template' } @$_) > 0
+} @cmdlineargs;
+
+my @tcompares = map {
+  my @cmdline = @$_;
+  my @lists = map { [split('-',$_->[1])] } grep { $_->[0] eq '--tcompare' } @cmdline;
+  my $errors = grep {
+    if (scalar(@$_) != 2) {
+      print STDERR "'", join('-', @$_), "' isn't of the form LABEL1-LABEL2!\n";
+    }
+  } @lists;
+  die "Aborting.\n" if $errors;
+  \@lists;
+} @cmdlineargs;
+
+my @tcomparesummaries = map {
+  my @cmdline = @$_;
+  my @lists = map { [split('-',$_->[1])] } grep { $_->[0] eq '--tcomparesummary' } @cmdline;
+  my $errors = grep {
+    if (scalar(@$_) != 3) {
+      print STDERR "'", join('-', @$_), "' isn't of the form LABEL1-LABEL2-PTS!\n";
+    }
+  } @lists;
+  die "Aborting.\n" if $errors;
+  \@lists;
+} @cmdlineargs;
+
+# this list associates each prefix to its new prefix and a list of file names
+# (without the prefix and without the .bxh extension).
+my @translist = map {
+  my $ind = $_;
+  my $prefix = $prefixes[$ind];
+  my $newprefix = $newprefixes[$ind];
+  my @bases = ();
+  push @bases, ['baselineAvg'];
+  if ($didbrainmask[$ind]) {
+    push @bases, ['brainmask', 'short'];
+  }
+  push @bases, map {
+    my $querylabel = $_;
+    map
+      { ["${querylabel}_${$_}[0]", $_->[1]] }
+      (['avg'], ['avg_percent'], ['std'], ['std_percent'], ['n', 'short'],
+       $didtmaps[$ind] ? (['cor'], ['tmap']) : ());
+  } @{$querylabels[$ind]};
+  push @bases, map {
+    my ($label1, $label2) = @$_;
+    ["${label1}_vs_${label2}_tmap"]
+  } @{$tcompares[$ind]};
+  push @bases, map {
+    my ($label1, $label2, $PTS) = @$_;
+    $PTS =~ s/:/-/g;
+    (
+     (
+      map {
+	(["${label1}_summary_${PTS}_${$_}[0]", $_->[1]],
+	 ["${label2}_summary_${PTS}_${$_}[0]", $_->[1]])
+      } (['avg'], ['avg_percent'], ['std'], ['std_percent'], ['n', 'short'])
+     ),
+     (
+      ["${label1}_vs_${label2}_summary_${PTS}_tmap"]
+     )
+    );
+  } @{$tcomparesummaries[$ind]};
+  @bases = grep {
+    my ($name, $datatype) = @$_;
+    my $oldfilename = "${prefix}_${name}.bxh";
+    if (-r $oldfilename) {
+      1;
+    } else {
+      print STDERR "Warning: ignoring non-existent/unreadable file '$oldfilename'.\n";
+      0;
+    }
+  } @bases;
+  [ $prefix, $newprefix, @bases];
+} (0..$#prefixes);
+
+for my $transref (@translist) {
+  my @cmd = ();
+  my ($prefix, $newprefix, @bases) = @$transref;
+
+  # fix matrix translations to account for differing FOVs
+  my @output2standardmat = read_feat_mat("${prefix}_output2standard.mat");
+  my $standardreforig = "${prefix}_reg_standard";
+  my $resref = "${prefix}_reg_${opt_refvol}";
+  if (!find_any_analyze_format($resref, 1)) {
+    $resref = ${opt_refvol};
+  }
+  my $newref = "${newprefix}_reg_refvol";
+
+  print STDERR "Creating new refvol from template '$standardreforig' and resolution from '$resref'\n";
+  my $newreffile = create_new_refvol($newref, $standardreforig, $resref, $progavwhd, $progavwcreatehd);
+
+  my $initmatfile = "${newprefix}_output2standard.mat";
+  @output2standardmat = fix_feat_mat(\@output2standardmat, $standardreforig, $newref, $progavwhd);
+  write_feat_mat([\*STDERR], $initmatfile, @output2standardmat);
+
+  my $tmptransbase = "${newprefix}_tmptrans";
+  my $tmptransnii = "${newprefix}_tmptrans.nii";
+
+  for my $baseref (@bases) {
+    my ($name, $datatype) = @$baseref;
+
+    print STDERR "Transforming ${prefix}_${name}\n";
+
+    my $oldfilebase = "${prefix}_${name}";
+    my $oldfilebxh = "${oldfilebase}.bxh";
+    my $newfilebase = "${newprefix}_${name}";
+    my $newfilebxh = "${newfilebase}.bxh";
+
+    if ($opt_updateonly) {
+      my @oldstat = stat($oldfilebxh);
+      my @newstat = stat($newfilebxh);
+      if (@newstat && $newstat[9] > $oldstat[9]) {
+	print STDERR "$newfilebxh already up to date.  Skipping...\n";
+	next;
+      }
+    }
+
+    if (-f "${oldfilebase}.nii" || -f "${oldfilebase}.nii.gz") {
+      my $retmat = flirt_apply_transform([\*STDOUT], $oldfilebase, $newfilebase, undef, $newref, \@output2standardmat, "${newprefix}_output2standard", $newprefix, $datatype, $progflirt, $progavwhd, $progavwcreatehd, $progavwswapdim, $progavworient, $proganalyze2bxh);
+    } else {
+      # need to create nifti files
+      unlink $tmptransnii;
+      @cmd = ();
+      push @cmd, $progbxh2analyze;
+      push @cmd, '--nii', '-b', '-s', '-v';
+      push @cmd, $oldfilebxh;
+      push @cmd, $tmptransbase;
+      run_cmd([\*STDOUT], @cmd);
+
+      my $retmat = flirt_apply_transform([\*STDOUT], $tmptransbase, $newfilebase, undef, $newref, \@output2standardmat, "${newprefix}_output2standard", $newprefix, $datatype, $progflirt, $progavwhd, $progavwcreatehd, $progavwswapdim, $progavworient, $proganalyze2bxh);
+
+      unlink $tmptransnii;
+    }
+  }
+  unlink $newreffile;
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.7  2007/11/30 15:28:54  gadde
+# Fix for FSL4.0.
+#
+# Revision 1.6  2007/04/02 16:10:14  gadde
+# Add percent signal change summaries.
+#
+# Revision 1.5  2007/03/20 17:44:02  gadde
+# Allow use of arbitrary reference volumes
+#
+# Revision 1.4  2007/01/25 18:22:56  gadde
+# Fix bug in regexp.
+#
+# Revision 1.3  2007/01/25 16:06:35  gadde
+# Update to include tcomparesummary options.
+#
+# Revision 1.2  2006/10/20 17:04:29  gadde
+# Move flirt transformations to helper function
+#
+# Revision 1.1  2006/09/08 16:13:59  gadde
+# Initial import.
+#

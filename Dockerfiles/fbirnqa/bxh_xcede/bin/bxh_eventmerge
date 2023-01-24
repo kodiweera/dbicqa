@@ -1,0 +1,233 @@
+#!/usr/bin/env perl
+
+use strict;
+
+use File::Spec;
+use Config;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use File::Which;
+
+my $usage = <<EOM;
+Usage:
+  bxh_eventmerge [ --debug ] [ --eventpath XPATH ] [ --mergeeventpath XPATH ] [ --mergequery XPATH ] [ --grabincludeset XPATH ] [ --grabexcludeset XPATH ] INPUTQUERY GRABQUERY inputevents1.xml inputevents2.xml... mergeevents.xml
+
+This program takes several input files (inputevents*.xml) and "merges"
+the information from another event file (mergeevents.xml) into each input
+file.  Here is the algorithm:
+
+1. Create sets of event nodes in the input and merge event files using the
+   XPaths specified by --eventpath and --mergeeventpath.  Default for
+   --eventpath, if not specified, is //events/event (but namespace-agnostic),
+   and default for --mergeeventpath is the specified or default value of the
+   --eventpath option.
+2. Each event node in the input event files will have a "match" value created
+   by applying the XPath INPUTQUERY.
+3. Each event node in the merge event file will have a "match" value created
+   by applying the XPath specified by the --mergequery option (which is set to
+   INPUTQUERY by default).
+4. For each event node in the input event file whose "match" value is
+   not an empty string, and which matches the "match" value of an event node
+   in the merge event file:
+   a. Apply GRABQUERY to the matching merge event, and recursively copy every
+      node in the result set, *but*:
+      i.  if --grabincludeset is specified, only include those nodes that are
+          also in the set created by applying the XPath specified by
+          --grabincludeset to the merge event.
+      ii. if --grabexcludeset is specified, exclude those nodes that are
+          also in the set created by applying the XPath specified by
+          --grabexcludeset to the merge event.
+5. All non-matching events in the input files will be output without
+   change.
+
+The output files will be named the same as the inputs, but starting
+with the prefix "merged-".
+EOM
+
+sub findexecutable {
+  my ($execname) = @_;
+  my $retval = undef;
+  my ($progvol, $progdirs, $progfile) = File::Spec->splitpath($0);
+  my @progdirs = File::Spec->splitdir($progdirs);
+  my $exeext = '';
+  foreach my $appenddir (undef, File::Spec->catdir("..", "utils")) {
+    if (defined($appenddir)) {
+      $retval = File::Spec->catpath($progvol, File::Spec->catdir(@progdirs, $appenddir), "$execname");
+    } else {
+      $retval = File::Spec->catpath($progvol, $progdirs, "$execname");
+    }
+    if ($Config{'osname'} eq 'MSWin32') {
+      return $retval if (-e $retval && -d $retval);
+    } else {
+      return $retval if (-x $retval);
+    }
+    if ($Config{'osname'} eq 'MSWin32') {
+      if (defined($appenddir)) {
+	$retval = File::Spec->catpath($progvol, File::Spec->catdir(@progdirs, $appenddir), "${execname}.exe");
+      } else {
+	$retval = File::Spec->catpath($progvol, $progdirs, "${execname}.exe");
+      }
+      return $retval if (-e $retval && -d $retval);
+    }
+  }
+  return which($execname); # from File::Which
+}
+
+my $opt_mergequery = undef;
+my $opt_inputeventpath = undef;
+my $opt_mergeeventpath = undef;
+my $opt_grabincludeset = undef;
+my $opt_grabexcludeset = undef;
+
+my $opt_debug = 0;
+
+my @origARGV = @ARGV;
+my @oldARGV = @ARGV;
+@ARGV = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)?(.*))$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  if ($opt eq 'help') {
+    print STDERR $usage;
+    exit(-1);
+  } elsif ($opt eq 'mergequery' && defined($optarg)) {
+    shift @oldARGV;
+    $opt_mergequery = $optarg;
+  } elsif ($opt eq 'inputeventpath' && defined($optarg)) {
+    shift @oldARGV;
+    $opt_inputeventpath = $optarg;
+  } elsif ($opt eq 'mergeeventpath' && defined($optarg)) {
+    shift @oldARGV;
+    $opt_mergeeventpath = $optarg;
+  } elsif ($opt eq 'grabincludeset' && defined($optarg)) {
+    shift @oldARGV;
+    $opt_grabincludeset = $optarg;
+  } elsif ($opt eq 'grabexcludeset' && defined($optarg)) {
+    shift @oldARGV;
+    $opt_grabexcludeset = $optarg;
+  } elsif ($opt eq 'debug' && !defined($opteq)) {
+    $opt_debug++;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+}
+
+if (scalar(@ARGV) < 4) {
+  print $usage;
+  exit(-1);
+}
+
+my ($progvol, $progdirs, $progfile) = File::Spec->splitpath($0);
+my @progdirs = File::Spec->splitdir($progdirs);
+my $xslfile = File::Spec->catpath($progvol, $progdirs, 'bxh_eventmerge.xsl');
+if (! -e $xslfile) {
+  if ($#progdirs > 0 && $progdirs[$#progdirs-1] eq 'bin') {
+    # $progdirs[$#progdirs] is assumed to be ''
+    $xslfile = File::Spec->catpath($progvol, File::Spec->catdir(@progdirs[0..$#progdirs-2], 'lib', $progdirs[$#progdirs]), 'bxh_eventmerge.xsl');
+  }
+}
+if (! -e $xslfile) {
+  die "Can't find stylesheet 'bxh_eventmerge.xsl' in the normal places!\n";
+}
+
+my $progXalan = findexecutable("Xalan");
+my $progxsltproc = findexecutable("xsltproc");
+if (!defined($progXalan) && !defined($progxsltproc)) {
+  die "Can't find executable 'Xalan' or 'xsltproc'!\n(this script requires one of them needs to be installed)\n";
+}
+
+my $inputquery = shift @ARGV;
+my $grabquery = shift @ARGV;
+my $mergedoc = pop @ARGV;
+for my $arg ($grabquery, $inputquery, $mergedoc, $xslfile) {
+  if (defined($progXalan)) {
+    $arg =~ s/"/"'"'"/g;
+  } elsif (defined($progxsltproc)) {
+    $arg =~ s/'/'"'"'/g;
+  }
+}
+
+while (@ARGV > 0) {
+  my $inputpath = shift @ARGV;
+  my ($inputvol, $inputdirs, $inputfile) = File::Spec->splitpath($inputpath);
+  my $newfile = "merged-$inputfile";
+  my $newpath = File::Spec->catpath($inputvol, $inputdirs, $newfile);
+  for my $arg ($inputpath, $newpath) {
+    $arg =~ s/"/"'"'"/g;
+  }
+  my $cmd = "";
+  if (defined($progXalan)) {
+    my $ext = '';
+    if ($opt_mergequery) {
+      $ext .= " -p mergequery '\"'\"$opt_mergequery\"'\"'";
+    }
+    if ($opt_inputeventpath) {
+      $ext .= " -p inputeventpath '\"'\"$opt_inputeventpath\"'\"'";
+    }
+    if ($opt_mergeeventpath) {
+      $ext .= " -p mergeeventpath '\"'\"$opt_mergeeventpath\"'\"'";
+    }
+    if ($opt_grabincludeset) {
+      $ext .= " -p grabincludeset '\"'\"$opt_grabincludeset\"'\"'";
+    }
+    if ($opt_grabexcludeset) {
+      $ext .= " -p grabexcludeset '\"'\"$opt_grabexcludeset\"'\"'";
+    }
+    $cmd = "$progXalan -p mergedoc '\"'\"$mergedoc\"'\"' -p query '\"'\"$inputquery\"'\"' -p grabquery '\"'\"$grabquery\"'\"' \"$inputpath\"$ext \"$xslfile\" > \"$newpath\"";
+  } elsif (defined($progxsltproc)) {
+    my $ext = '';
+    if ($opt_mergequery) {
+      $ext .= " --stringparam mergequery '$opt_mergequery'";
+    }
+    if ($opt_inputeventpath) {
+      $ext .= " --stringparam inputeventpath '$opt_inputeventpath'";
+    }
+    if ($opt_mergeeventpath) {
+      $ext .= " --stringparam mergeeventpath '$opt_mergeeventpath'";
+    }
+    if ($opt_grabincludeset) {
+      $ext .= " --stringparam grabincludeset '$opt_grabincludeset'";
+    }
+    if ($opt_grabexcludeset) {
+      $ext .= " --stringparam grabexcludeset '$opt_grabexcludeset'";
+    }
+    if ($opt_debug) {
+      $ext .= " -v";
+    }
+    $cmd = "$progxsltproc --stringparam mergedoc '$mergedoc' --stringparam inputquery '$inputquery' --stringparam grabquery '$grabquery'$ext '$xslfile' '$inputpath' > '$newpath'";
+  }
+  print STDERR "Creating $newpath\n";
+  if ($opt_debug) {
+    print STDERR "$cmd\n";
+  }
+  system($cmd);
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.4  2005/09/20 18:37:55  gadde
+# Updates to versioning, help and documentation, and dependency checking
+#
+# Revision 1.3  2005/09/19 16:31:56  gadde
+# Documentation and help message updates.
+#
+# Revision 1.2  2005/07/14 18:52:17  gadde
+# fix help message
+#
+# Revision 1.1  2005/07/14 17:17:23  gadde
+# Initial import.
+#

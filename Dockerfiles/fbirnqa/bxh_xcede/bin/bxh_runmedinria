@@ -1,0 +1,238 @@
+#!/usr/bin/env perl
+
+#########################################################
+# cp 07/2011
+# script takes bxh input and converts to 4D niigz with
+#    only 1 b0 at beginning, followed by the remaining 
+#    directions.
+# extracts diff dirs from the bxh, creates MedINRIA .dts
+# then runs dtitrack
+#########################################################
+#########################################################
+# sg 08/2011
+# added code to remove dependency on XML::LibXML and
+# integrate into BXH/XCEDE Tools
+#########################################################
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use XMLUtils;
+use BXHPerlUtils;
+
+our %OPTS = ();
+
+Getopt::Long::Configure ('bundling');
+GetOptions(\%OPTS,
+            "dti=s",        # --input
+	        "prefix=s",     # --output
+            "h|help"        # --help
+          );
+
+#print Dumper(%OPTS);
+
+if ( !%OPTS ) {
+	usage();
+} elsif ( $OPTS{h} || $OPTS{help} ) {
+	usage();
+} elsif ( !$OPTS{dti} ) {
+	usage("Please provide input bxh!");
+} elsif ( !$OPTS{prefix} ) {
+	usage("Please provide output prefix!");
+}
+
+#does input bxh exist
+if ( !-e $OPTS{dti} ) {
+	usage("input file does not exist");
+}
+
+#check to see if a directory was in prefix and if it exists
+my @splitdir;
+if ( $OPTS{prefix} =~ /\// ) {
+    @splitdir = split('/',$OPTS{prefix});
+    delete $splitdir[-1];
+    if ( !-d File::Spec->catdir(@splitdir) ) {
+        usage("output directory does not exist");
+    }
+}
+
+my %EXECS = (
+    MEDINRIA => findexecutable('MedINRIA'),
+    BXH2ANALYZE => findexecutable('bxh2analyze'),
+    EXTRDIFFDIR => findexecutable('extractdiffdirs'),
+);
+
+#print Dumper(%EXECS);
+
+#check for executables
+foreach ( keys %EXECS ) {
+    if ( !defined($EXECS{$_}) || !-f $EXECS{$_} ) {
+        usage("executable ( $_ ) does not exist:");
+    }
+}
+
+#extract bvals from original bxh
+my $doc	= XMLUtils::readXMLFile( $OPTS{dti} );
+my $query = "//bxh:bvalues";
+my $bvalstr = XMLUtils::xpathFindValue($query, $doc);
+print Dumper($bvalstr);
+
+if ( !$bvalstr ) {
+     die "no bvalues found in $OPTS{dti}: $!";
+}
+
+my $idx = 0;
+my %bvals;
+foreach ( split(' ',$bvalstr) ) {
+    $bvals{$idx} = $_;
+    $idx++;
+}
+
+#print Dumper(%bvals);
+
+#determine the b0 and diffusion timepoints
+my (@bzeros, @difftps);
+#sort numerically
+foreach my $bidx ( sort {$a <=> $b} (keys %bvals)  ) {
+    if ( $bvals{$bidx} eq 0 ) {
+        push( @bzeros, $bidx );
+    } else {
+        push( @difftps, $bidx );
+    }
+}
+
+if ( !(@bzeros) || !(@difftps) ) {
+    die "no valid b-zero or diffusion directions: $!";
+}
+
+##create a string of timepoints for bxhselect
+#my $tpstr = $bzeros[0] . ',' . join(',',@difftps);
+
+my ($cmd, $thisdts);
+
+$cmd = "$EXECS{BXH2ANALYZE} --overwrite --niigz -s $OPTS{dti} $OPTS{prefix}";
+print "Running: $cmd\n";
+
+if ( system($cmd) ) {
+    die "$OPTS{dti} could not be converted: $!";
+} else {
+    if ( -f $OPTS{prefix} . ".bxh" ) {
+        $cmd = "$EXECS{EXTRDIFFDIR} --overwrite --medinria $OPTS{prefix}.bxh $OPTS{prefix}.bvec";
+        print "Running: $cmd\n";
+        if ( system($cmd) ) {
+            die "diffusion directions could not be extracted: $!";            
+        } else {
+            $thisdts = create_dts($OPTS{prefix});
+            if ( $thisdts ) {
+                $cmd = "$EXECS{MEDINRIA} -gui 0 -mod dtitrack -dts $thisdts -track -save";
+                print "Running: $cmd\n";
+                system($cmd);
+            }
+        }
+    } else {
+        die "$OPTS{prefix}.bxh does not exist: $!";
+    }
+}
+
+
+#create a .dts file from default vals
+sub create_dts {
+my ( $prefix ) = @_;
+    if ( -f $prefix . ".nii.gz" && -f $prefix . ".bvec" ) {
+
+        open(my $BVECS, '<', $prefix . ".bvec") or die "cannot open bvecs file: $!";
+
+        my @vecs = <$BVECS>;
+        chomp(@vecs);
+        close($BVECS);
+
+        my $vecstr;
+        foreach ( @vecs ) {
+            $vecstr .= "$_\n";
+        }
+
+        my @splitpath = split('/',$prefix);
+        my $outdtsname = $splitpath[-1] . ".dts";
+        my $niiname = $splitpath[-1] . ".nii.gz";
+
+        my $outdts = <<EOF;
+<StudyName>
+$outdtsname
+<PatientName>
+Not_Communicated
+<NumberOfDTIs>
+1
+<DTIs>
+$niiname
+<GradientList>
+$vecstr
+<ModelType>
+Tensor
+<Tensors>
+Not_Computed
+<AllFibers>
+Not_Computed
+<NumberOfFibers>
+0
+<BST>
+200
+<Smoothness>
+0.2
+<MinLength>
+10
+<MaxLength>
+200
+<FAThreshold>
+0.3
+<TimeStep>
+0.5
+<UseTriLinearInterpolation>
+1
+<Sampling>
+1
+<AffineTransform>
+1 0 0 0 1 0 0 0 1 0 0 0 
+<FlipAxes>
+0 0 0
+EOF
+        open(my $OUTPUT, '>', $prefix . ".dts" ) or die "cannot create output file: $!";
+        print $OUTPUT $outdts;
+        close($OUTPUT);
+    }
+
+    if ( -f  $prefix . ".dts" ) {
+        return $prefix . ".dts";
+    } else {
+        return undef;
+    }
+}
+
+
+
+sub usage {
+  my ($mesg) = @_;
+
+  print "$mesg\n" if $mesg;
+  die << "EOF";
+USAGE: $0 [options] --dti BXH --prefix NAME
+
+where [OPTIONS] may be the following:
+   --help         displays this help
+   --dti  	      input dti BXH header *
+   --prefix       prefix for output (can include path) *
+
+input dti is converted into a MedINRIA compatible niigz 
+bvectors are extracted from bxh header of compatible niigz.
+a shell .dts is created and MedINRIA dtitrack is run in
+    command line mode.
+prefix may contain directory names, but directory must exist.
+
+EOF
+
+}

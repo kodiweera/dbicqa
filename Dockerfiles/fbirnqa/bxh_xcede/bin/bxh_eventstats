@@ -1,0 +1,1419 @@
+#!/usr/bin/env perl
+
+my $rcsid = '$Id: bxh_eventstats,v 1.58 2008-12-12 16:17:08 gadde Exp $ ';
+
+use strict;
+
+use File::Spec;
+use File::Path;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use BXHPerlUtils;
+
+my $usage = <<EOM;
+Usage:
+  bxh_eventstats [opts] outputprefix imgfile1 eventfile1a[,eventfile1b...] \
+                        [imgfile2 eventfile2a[,eventfile2b...] ...]
+
+This program "queries" a 4-D data set (with corresponding event lists)
+and produces averages of all time courses surrounding each event that
+match the query.  Multiple independent queries may be specified, and
+the width and position of each time course relative to the event is
+also user-specified.  Multiple event files corresponding to the same
+image data can be specified separated by commas (the filenames/paths
+themselves are therefore prohibited from containing commas).  This
+program also correlates the time series of each voxel in a 4-D time
+series of volumes (inputxmlfile) with a given "template" vector
+(specified with --template option).  Outputs (in FILE_cor.bxh and
+FILE_tmap.bxh) are 3-D data sets storing the correlation coefficient
+(r) and the corresponding t-statistic (derived from r).  T-statistics
+of the comparison between two queries is also supported (using the
+--tcompare option).
+
+Options:
+  --noaverage
+        Skip everything up to and including averaging/stddev, just do
+        correlation.  Assumes averaging was performed previously using this
+        script (or the equivalent) with the same outputprefix and queries,
+        otherwise it will not be able to find the correct files.
+  --nocorrelate
+	Do not run correlation or single-condition t-tests, just do averaging.
+  --optsfromfile <str>
+  --optsfromfile=<str>
+        Program options (i.e. those starting with '--') will come from this
+        file.  If this option is specified, then the options in the file will
+        be applied after all command-line options.  The options (and their
+        arguments) should be specified one per line, with the leading '--'
+        omitted.
+  --createbrainmask
+        Create a brain mask using bxh_brainmask (using the default 'localmin'
+        histogram method) on the first image and use this for all steps.  This
+        option is incompatible with the --maskfile option.
+  --brainmaskmethod <str>
+  --brainmaskmethod=<str>
+        Method to use for creating the brain mask.
+        'threshold' marks those voxels whose mean value over time are not less
+        than a given threshold (provided by --brainmaskthresh).
+        'rank' chooses the largest threshold that allows at least the n
+        highest-valued voxels (as determined by the mean value of the voxel
+        over time) where n is specified by --brainmaskrank.
+        'localmin' fits a 5th-order polynomial to an intensity histogram of the
+        minimum value of each voxel over time, and chooses the first local
+        minimum (disregarding the first point) as the threshold.  This method
+        assumes the data follows an intensity distribution with at least two
+        "humps", the first (lower) of which reflects noise.
+        Default is 'localmin'.
+  --brainmaskorder <uint>
+  --brainmaskorder=<uint>
+        Order of the polynomial used for --brainmaskmethod localmin.  Default
+        is 5.
+  --brainmaskthresh <str>
+  --brainmaskthresh=<str>
+        Threshold used for --brainmaskmethod threshold.  If value ends with
+        the percent sign (%), then this is taken as a percent of maximum
+        intensity.  Default is '50%'.
+  --brainmaskrank <str>
+  --brainmaskrank=<str>
+        Threshold used for --brainmaskmethod rank.  If value ends with the
+        percent sign (%), then this is taken as a percent of the number of
+        total voxels.  Default is '20%'.
+  --tfiltertype <str>
+  --tfiltertype=<str>
+        This option, if present, adds temporal filtering using a Chebyshev
+        filter, and chooses which type of filtering to use.  Valid choices are
+        'lowpass', 'highpass', 'bandpass', or 'bandstop'.  Each filter is
+        parameterized by one or more instances of --tfilterperiod.  'lowpass'
+        or 'highpass' require one --tfilterperiod option, specifying the stop
+        or start frequency respectively.  'bandpass' or 'bandstop' require two
+        --tfilterperiod options, specifying the start and stop frequencies, in
+        any order (larger period/smaller frequency is assumed to be start
+        frequency for 'bandpass' and stop frequency for 'bandstop').
+  --tfilterperiod <double>
+  --tfilterperiod=<double>
+        This option specifies the frequency parameters for the filter in terms
+        of the period (i.e. 1/frequency) in seconds per cycle.  May be
+        specified once for 'lowpass' and 'highpass' filter types, twice for
+        'bandpass' and 'bandstop' filter types, and must be greater than 0.
+  --tfilterripple <double>
+  --tfilterripple=<double>
+        This option specifies the percent ripple for the Chebyshev filter.  If
+        0 [zero], which is the default, then the filter is a Butterworth
+        filter.
+  --tfilterorder <uint>
+  --tfilterorder=<uint>
+        Order of the temporal filter.  Default is 6.
+  --forcetr <double>
+  --forcetr=<double>
+        If specified, this value (in seconds) will replace the TR specified in
+        the input image file, if any.
+  --querylanguage <str>
+  --querylanguage=<str>
+        The language used for all queries.  Valid values are 'XPath' and
+        'event'.  Case is irrelevant.  Default is 'XPath'.
+  --query <str>
+  --query=<str>
+        A query string as an XPath boolean expression.  Will be applied as a
+        predicate filter to each event.  Each event node may or may not have
+        onset, duration, type, and value elements (as well as others).
+        Examples:
+          --query "value[\@name='color']='red'"
+          --query "value[\@name='color']='red' or value[\@name='color']='blue'"
+          --query "(value[\@name='color']='red' or value[\@name='color']='blue')
+                   and not value[\@name='field']='upper' and onset>12000"
+        Note that some characters in queries may need to be protected from the
+        shell with quotes (as in the above examples).  Separate instances of
+        the --query option will result in independent queries, with separate
+        outputs.  Empty queries match all events.  NOTE: At least one query
+        must be specified!
+  --queryfilter <str>
+  --queryfilter=<str>
+        If this option is specified, it is an XPath query (like --query) that
+        is applied to a list of pseudo-events, each pseudo-event corresponding
+        to an event matching the original query.  Each pseudo-event is a
+        merging of all events that are simultaneously in effect at the time of
+        the onset of the real event.  If this query matches the pseudo-event,
+        the real event passes through the filter.  The n-th instance of this
+        option corresponds to the n-th specified query.  If any --queryfilter
+        options are specified, there should be exactly one --queryfilter per
+        --query.Empty or missing filter queries match everything.
+  --queryepochexclude <str>
+  --queryepochexclude=<str>
+        Like --query, --queryepochexclude specifies an XPath-based event query.
+        However, any epoch that includes an event that matches this query will
+        be excluded from the analysis.  The epoch surrounding an event is
+        specified using --ptsbefore and --ptsafter.  The n-th instance of this
+        option corresponds to the n-th specified query.  If any
+        --queryepochexclude options are specified, there should be exactly one
+        --queryepochexclude per --query.Empty or missing epoch exclusion
+        queries exclude nothing.
+  --querylabel <str>
+  --querylabel=<str>
+        A textual label for the corresponding query.  The first instance of
+        this option corresponds to the first specified query.  There should be
+        at most one --querylabel per --query.  Default label is the query
+        number.
+  --forcetr <double>
+  --forcetr=<double>
+        If specified, this will replace the TR specified in the input image
+        file, if any.
+  --nointerp
+        If specified, no interpolation will be done -- events will be assumed
+        to occur at the closest TR/image acquisition time.
+  --mirrorflip
+        If specified (and if necessary) the input signal will be padded on
+        either side with the mirrored/flipped signal to enable enough
+        timepoints for interpolation at the boundaries.  If not specified, any
+        epochs with an interpolation range outside the range of the data will
+        be excluded.
+  --scalebl
+        If specified, values in each epoch are additionally scaled by dividing
+        by (after subtracting) the baseline.  This affects the 'avg' and 'std'
+        output images.  Percent signal-change images are not written.  WARNING:
+        Know what you are doing before using this option.
+  --tcompare <str>
+  --tcompare=<str>
+        This specifies an additional t-test comparison between two queries.
+        The string argument is in the form "A-B", where A and B are query
+        labels (as specified using --querylabel) or query indices (starting
+        at 1) if no query labels have been specified.  Multiple instances of
+        this option are allowed.
+  --tcomparesummary <str>
+  --tcomparesummary=<str>
+        This option specifies a t-test comparison where the two waveforms
+        are constructed by creating a new set of "summary" timepoints each
+        of which "summarize" one or more timepoints in the original epoch.
+        For example, in a 12-timepoint epoch, one may be interested in
+        statistics that treat the epoch as 3 groups of 4 timepoints,
+        and the first point in the "summary" epoch is treated as the
+        mean of the first 4 timepoints, and the second and third summary
+        timepoints are calculated similarly.  This may also be useful for
+        block designs where an epoch spans multiple blocks.  The format of
+        the string argument is "A-B-PTS" where A and B are query labels as in
+        --tcompare.  The grouped subsets of the epoch are specified by PTS,
+        which is a plus('+')-separated list of "groups", a "group" being a
+        comma-separated list of either single numeric timepoint indices
+        (within the epoch) or ranges, which are two indices separated by a
+        colon.  For example, "A-B-0:3+4:7+8:11" will group into three groups
+        of 4 timepoints (as described above), and "A-B-0:3,8:11+4:7"
+        will aggregate both the first and third sets of 4 points as a group.
+        IMPORTANT: note that timepoints are indexed from 0.  Outputs will be
+        written to PREFIX_A_vs_B_PTS_tmap.bxh.  Multiple instances of this
+        option are allowed.
+  --template <str>
+  --template=<str>
+        A comma-separated list of numbers making up the template vector to
+        correlate with the data.  This option is required.
+  --overwrite
+        Overwrite existing output files (otherwise error and exit).
+  --ptsbefore <uint>
+  --ptsbefore=<uint>
+        How many time points before the event to include in analysis.  This
+        option is required.
+  --ptsafter <uint>
+  --ptsafter=<uint>
+        How many time points after the event to include in analysis.  This
+        option is required.
+  --basestartoffset <int>
+  --basestartoffset=<int>
+        Where to start calculating mean baseline, in number of timepoints (TRs)
+        relative to event time.  A negative number refers to a timepoint before
+        the event, 0 is at the time of the event, and a positive number is
+        after the event.  Default is 0.
+  --baseendoffset <int>
+  --baseendoffset=<int>
+        Where to end calculating mean baseline, in number of timepoints (TRs)
+        relative to event time.  A negative number refers to a timepoint before
+        the event, 0 is at the time of the event, and a positive number is
+        after the event.  Default is 0.
+  --startpt <uint>
+  --startpt=<uint>
+        This number of time points at the start of the data will be ignored.
+        Default is 0.
+  --endpt <uint>
+  --endpt=<uint>
+        Time points after this point will be ignored.  Default is last
+        timepoint.
+  --maskfile <str>
+  --maskfile=<str>
+        Use this 3-D mask (should be an XML file) before doing calculations.
+        This option is incompatible with the --createbrainmask option.
+  --extracttrials
+        If this option is specified, the program will write out epochs for
+        *all* extracted trials to a file PREFIX_QUERY_trials.bxh.  This file
+        will be a 5-D image file where the 4th dimension goes across time
+        points within an epoch, and the 5th dimension represents the global
+        trial number.
+  --trialmax
+        This is an EXPERIMENTAL option.  If specified, a 'seed' timepoint and
+        voxel is found within the ROI specified by --trialmaxroi.  The seed
+        timepoint is defined as the timepoint within the epoch average that has
+        the highest mean intensity.  The seed voxel is then defined as the
+        voxel with the highest value within the seed timepoint.  Then, for each
+        voxel, a 'trial sequence' is constructed containing the value of that
+        voxel at the seed timepoint within each individual epoch (before
+        averaging).  The output is a 4-D series of volumes (one for each trial)
+        named PREFIX_QUERY_trialmax.bxh that contains the volumes at the seed
+        timepoint in each trial.  The seed voxel coordinates are written to
+        PREFIX_QUERY_trialmaxseed.txt.
+  --trialmaxroi <str>
+  --trialmaxroi=<str>
+        The ROI used by --trialmax.
+  --trialmaxseed <str>
+  --trialmaxseed=<str>
+        This specifies an explicit comma-separated coordinate X,Y,Z,T for the
+        seed for --trialmax, to be applied to ALL queries.  The T coordinate
+        must be in the range [0,s-1] where s is the number of time points in
+        the epoch.  Note that timepoints are indexed from 0.
+  --trialmaxnodelete
+        If specified, the temporary files used by trialmaxnodelete
+        (PREFIX_QUERY_trialmax.bxh and PREFIX_QUERY_trialmax.nii.gz) are not
+        deleted.
+  --extracttimingonly
+        If specified, only the PREFIX_LABEL_timing.txt files will be written.
+  --memorylimit <double>
+  --memorylimit=<double>
+        This specifies the number of megabytes of the input data to read at a
+        time.  Default is to read the entire data at once.  If you are running
+        out of memory due to high-resolution data, or large numbers of
+        timepoints, this is one way to reduce memory usage.  This is not an
+        overall memory usage limit -- actual memory usage will surely be much
+        higher than this.
+  --featinputs
+        If specified, all input images are assumed to be FSL/FEAT first-level
+        analysis output directories, and the filtered_func_data images will be
+        used.  The inputs will be transformed to the selected "averaging space"
+        (see --featavgspace) for averaging, then outputs are transformed to
+        "output space" (see --featoutputspace).  The appropriate
+        transformation matrices example_func2highres, example_func2standard, or
+        example_highres2standard must exist in the "reg" subdirectory of all
+        input .feat directories.
+  --featdatapath <string>
+  --featdatapath=<string>
+        If specified, this string overrides the default input data path
+        'filtered_func_data'.  This is a path to a 4-D image relative to the
+       .feat directory minus the extension, so, for example, specifying
+       'stats/res4D' would operate on the residuals of a first-level FEAT
+       analysis.
+  --featavgspace <string>
+  --featavgspace=<string>
+        If specified, this specifies the space in which the averages should
+        be computed.  This can be "highres" or "standard".  Default is
+        to do the averaging in the same space as the outputs (see
+        --featoutputspace).
+  --featoutputspace <string>
+  --featoutputspace=<string>
+        If specified, this specifies the space into which the FEAT-derived
+        outputs should be transformed.  This can be "highres" or "standard"
+        (default).  Furthermore, if "standard" is used, all
+        example_func2standard matrices must match exactly.
+  --featavgrefvol <string>
+  --featavgrefvol=<string>
+  --featoutputrefvol <string>
+  --featoutputrefvol=<string>
+        These options specify the reference volume to use for --featavgspace
+        or --featoutputspace respectively.  This must point to a .nii or
+        .hdr file (or just specify the base name without the extension).
+        This volume is only used to determine the resolution and voxel
+        spacing of the outputs.  If specified path is not an absolute pathname,
+        the path is relative to the reg subdirectory of the .feat directory.
+        Default is the "example_func" volume in the reg subdirectory of the
+        .feat directory (i.e. to keep the same resolution as the input
+        functional images).  Other typical values are "standard" and "highres".
+EOM
+
+my $progepochavg = findexecutable("bxh_epochavg");
+my $progcorrelate = findexecutable("bxh_correlate");
+my $progttest = findexecutable("bxh_ttest");
+my $progselect = findexecutable("bxhselect");
+my $progmean = findexecutable("bxh_mean");
+my $progbinop = findexecutable("bxh_binop");
+my $progunop = findexecutable("bxh_unop");
+my $progbrainmask = findexecutable("bxh_brainmask");
+my $progtfilter = findexecutable("bxh_tfilter");
+if (!defined($progepochavg)) {
+  print STDERR "Can't find program bxh_epochavg!\n";
+  exit -1;
+}
+if (!defined($progcorrelate)) {
+  print STDERR "Can't find program bxh_correlate!\n";
+  exit -1;
+}
+if (!defined($progttest)) {
+  print STDERR "Can't find program bxh_ttest!\n";
+  exit -1;
+}
+if (!defined($progselect)) {
+  print STDERR "Can't find program bxhselect!\n";
+  exit -1;
+}
+if (!defined($progmean)) {
+  print STDERR "Can't find program bxh_mean!\n";
+  exit -1;
+}
+if (!defined($progbinop)) {
+  print STDERR "Can't find program bxh_binop!\n";
+  exit -1;
+}
+if (!defined($progunop)) {
+  print STDERR "Can't find program bxh_unop!\n";
+  exit -1;
+}
+if (!defined($progbrainmask)) {
+  print STDERR "Can't find program bxh_brainmask!\n";
+  exit -1;
+}
+if (!defined($progtfilter)) {
+  print STDERR "Can't find program bxh_tfilter!\n";
+  exit -1;
+}
+# these will be used for --featinputs
+my $progflirt = findexecutable("flirt");
+my $proganalyze2bxh = findexecutable("analyze2bxh");
+my $progbxh2analyze = findexecutable("bxh2analyze");
+my $progavwhd = findexecutable("avwhd");
+my $progavworient = findexecutable("avworient");
+my $progavwswapdim = findexecutable("avwswapdim");
+my $progavwcreatehd = findexecutable("avwcreatehd");
+$progavwhd = findexecutable("fslhd") if (!defined($progavwhd));
+$progavworient = findexecutable("fslorient") if (!defined($progavworient));
+$progavwswapdim = findexecutable("fslswapdim") if (!defined($progavwswapdim));
+$progavwcreatehd = findexecutable("fslcreatehd") if (!defined($progavwcreatehd));
+
+my $opt_nocorrelate = 0;
+my $opt_noaverage = 0;
+my $opt_createbrainmask = 0;
+my $opt_brainmaskmethod = 'localmin';
+my $opt_brainmaskorder = undef;
+my $opt_brainmaskthresh = undef;
+my $opt_brainmaskrank = undef;
+my $opt_querylang = undef;
+my @opt_queries = ();
+my @opt_queryfilters = ();
+my @opt_queryepochexcludes = ();
+my @opt_querylabels = ();
+my $opt_ptsbefore = undef;
+my $opt_ptsafter = undef;
+my $opt_startpt = undef;
+my $opt_endpt = undef;
+my $opt_basestart = undef;
+my $opt_baseend = undef;
+my $opt_tfiltertype = undef;
+my @opt_tfilterperiod = ();
+my $opt_tfilterripple = undef;
+my $opt_tfilterorder = undef;
+my $opt_forcetr = undef;
+my $opt_nointerp = undef;
+my $opt_mirrorflip = undef;
+my $opt_scalebl = undef;
+my $opt_overwrite = undef;
+my $opt_maskfile = undef;
+my @opt_template = ();
+my @opt_tcompare = ();
+my @opt_tcomparesummary = ();
+my $opt_extracttrials = undef;
+my $opt_trialmax = undef;
+my $opt_trialmaxroi = undef;
+my $opt_trialmaxseed = undef;
+my $opt_trialmaxnodelete = undef;
+my $opt_extracttimingonly = undef;
+my $opt_memorylimit = undef;
+my $opt_featinputs = undef;
+my $opt_featavgspace = undef;
+my $opt_featoutputspace = 'standard';
+my $opt_featavgrefvol = 'example_func';
+my $opt_featoutputrefvol = 'example_func';
+my $opt_featdatapath = 'filtered_func_data';
+
+my @savedARGV = @ARGV;
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+my @optdata = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    push @optdata, ["--"];
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)(.*))?$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  my $usedoptarg = 0;
+  if ($opt eq 'help') {
+    print STDERR $usage;
+    exit(-1);
+  } elsif ($opt eq 'overwrite' && !defined($opteq)) {
+    $opt_overwrite++;
+  } elsif ($opt eq 'noaverage' && !defined($opteq)) {
+    $opt_noaverage++;
+  } elsif ($opt eq 'nocorrelate' && !defined($opteq)) {
+    $opt_nocorrelate++;
+  } elsif ($opt eq 'createbrainmask' && !defined($opteq)) {
+    $opt_createbrainmask++;
+  } elsif ($opt eq 'brainmaskmethod' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_brainmaskmethod = $optarg;
+  } elsif ($opt eq 'brainmaskorder' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_brainmaskorder = $optarg;
+  } elsif ($opt eq 'brainmaskthresh' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_brainmaskthresh = $optarg;
+  } elsif ($opt eq 'brainmaskrank' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_brainmaskrank = $optarg;
+  } elsif ($opt eq 'querylanguage' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_querylang = $optarg;
+  } elsif ($opt eq 'query' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    push @opt_queries, $optarg;
+  } elsif ($opt eq 'queryfilter' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    push @opt_queryfilters, $optarg;
+  } elsif ($opt eq 'queryepochexclude' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    push @opt_queryepochexcludes, $optarg;
+  } elsif ($opt eq 'querylabel' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    push @opt_querylabels, $optarg;
+  } elsif ($opt eq 'queryweight' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    print STDERR "Warning: ignoring option --queryweight NUMBER ...\n"
+  } elsif ($opt eq 'ptsbefore' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_ptsbefore = $optarg;
+  } elsif ($opt eq 'ptsafter' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_ptsafter = $optarg;
+  } elsif ($opt eq 'basestartoffset' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_basestart = $optarg;
+  } elsif ($opt eq 'baseendoffset' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_baseend = $optarg;
+  } elsif ($opt eq 'startpt' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_startpt = $optarg;
+  } elsif ($opt eq 'endpt' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_endpt = $optarg;
+  } elsif ($opt eq 'maskfile' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_maskfile = $optarg;
+  } elsif ($opt eq 'template' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    @opt_template = split(/,/, $optarg);
+  } elsif ($opt eq 'tcompare' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    my @tmpsplit = split(/-/, $optarg);
+    if (scalar(@tmpsplit) > 2) {
+      die "Too many labels in --tcompare $optarg\n";
+    }
+    push @opt_tcompare, [@tmpsplit];
+  } elsif ($opt eq 'tcomparesummary' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    my @tmpsplit = split(/-/, $optarg);
+    if (scalar(@tmpsplit) > 3) {
+      die "Error argument to --tcomparesummary ($optarg) has incorrect form.\nUse --help for more info\n";
+    }
+    push @opt_tcomparesummary, [@tmpsplit];
+  } elsif ($opt eq 'forcetr' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_forcetr = $optarg;
+  } elsif ($opt eq 'nointerp' && !defined($opteq)) {
+    $opt_nointerp++;
+  } elsif ($opt eq 'mirrorflip' && !defined($opteq)) {
+    $opt_mirrorflip++;
+  } elsif ($opt eq 'scalebl' && !defined($opteq)) {
+    $opt_scalebl++;
+  } elsif ($opt eq 'tfiltertype' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_tfiltertype = $optarg;
+  } elsif ($opt eq 'tfilterperiod' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    push @opt_tfilterperiod, $optarg;
+  } elsif ($opt eq 'tfilterripple' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_tfilterripple = $optarg;
+  } elsif ($opt eq 'tfilterorder' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_tfilterorder = $optarg;
+  } elsif ($opt eq 'extracttrials' && !defined($opteq)) {
+    $opt_extracttrials++;
+  } elsif ($opt eq 'trialmax' && !defined($opteq)) {
+    $opt_trialmax++;
+  } elsif ($opt eq 'trialmaxroi' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_trialmaxroi = $optarg;
+  } elsif ($opt eq 'trialmaxseed' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_trialmaxseed = $optarg;
+  } elsif ($opt eq 'trialmaxnodelete' && !defined($opteq)) {
+    $opt_trialmaxnodelete++;
+  } elsif ($opt eq 'extracttimingonly' && !defined($opteq)) {
+    $opt_extracttimingonly++;
+  } elsif ($opt eq 'memorylimit' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_memorylimit = $optarg;
+  } elsif ($opt eq 'featinputs' && !defined($opteq)) {
+    $opt_featinputs++;
+  } elsif ($opt eq 'featdatapath' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_featdatapath = $optarg;
+  } elsif ($opt eq 'featavgspace' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_featavgspace = $optarg;
+  } elsif ($opt eq 'featoutputspace' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_featoutputspace = $optarg;
+  } elsif ($opt eq 'featavgrefvol' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_featavgrefvol = $optarg;
+  } elsif ($opt eq 'featoutputrefvol' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_featoutputrefvol = $optarg;
+  } elsif ($opt eq 'optsfromfile' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    my $normset = '#"\'\s'; # delimiter of non-quoted expr
+    my $insquoteset = '\''; # delimiter inside single-quoted expr
+    my $indquoteset = '"'; # delimiter inside double-quoted expr
+    open(FH, '<', $optarg) || die "Error opening file '$optarg': $!\n";
+    push @savedARGV, "\nOptions from '$optarg': ";
+    while (<FH>) {
+      s/\s+$//; # remove trailing space (and newlines)
+      s/^\s+//; # remove leading space
+      # option name (if any) ends with whitespace or comment chars
+      my ($optname, $rest) = /^([^ \t\r\n\f\#]+)(.*)/;
+      next if (!defined($optname) || length($optname) == 0);
+      $_ = $rest;
+      s/^\s+//;
+      my $optarg = '';
+      my $foundarg = 0;
+      my $cset = $normset;
+      while (length($_) > 0) {
+	$foundarg = 1;
+	my ($match, $rest) = /^([^$cset]*)(.*)/;
+	if (defined($match)) {
+	  $optarg .= $match;
+	}
+	$_ = $rest;
+	s/^#.*//;
+	last if length($_) == 0;
+	if (/^\"/) {
+	  if ($cset eq $indquoteset) {
+	    $cset = $normset;
+	  } else {
+	    $cset = $indquoteset;
+	  }
+	} elsif (/^\'/) {
+	  if ($cset eq $insquoteset) {
+	    $cset = $normset;
+	  } else {
+	    $cset = $insquoteset;
+	  }
+	}
+	$_ = substr($_, 1); # get rid of parsed character/delim
+      }
+      push @oldARGV, "--$optname";
+      push @oldARGV, $optarg if $foundarg;
+      push @savedARGV, "--$optname";
+      push @savedARGV, $optarg if $foundarg;
+    }
+    close FH;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+  if ($opt ne 'optsfromfile') {
+    push @optdata, ["--" . $opt, $usedoptarg ? $optarg : ()];
+  }
+}
+
+if (scalar(@opt_querylabels) != 0 &&
+    scalar(@opt_querylabels) != scalar(@opt_queries)) {
+  die "Wrong number of 'querylabel' options (must be equal to number of 'query' options).  Use --help for help.\n";
+}
+
+if (scalar(@opt_queryfilters) != 0 &&
+    scalar(@opt_queryfilters) != scalar(@opt_queries)) {
+  die "Wrong number of 'queryfilter' options (must be equal to number of 'query' options).  Use --help for help.\n";
+}
+
+if (scalar(@opt_queryepochexcludes) != 0 &&
+    scalar(@opt_queryepochexcludes) != scalar(@opt_queries)) {
+  die "Wrong number of 'queryepochexclude' options (must be equal to number of 'query' options).  Use --help for help.\n";
+}
+
+if (grep { $_ =~ /_/ } @opt_querylabels) {
+    die "Sorry, querylabels must not contain underscores!\n";
+}
+
+if ($opt_createbrainmask && defined($opt_maskfile)) {
+  die "The options --createbrainmask and --maskfile are incompatible.\n";
+}
+
+if (scalar(@ARGV) < 3) {
+  die "Not enough arguments.  Use --help for help.\n";
+}
+
+for (my $argnum = 0; $argnum < scalar(@ARGV); $argnum++) {
+  next if ($argnum == 0 || ($argnum % 2) == 1);
+  my @files = split(/,/, $ARGV[$argnum]);
+  for my $eventfile (@files) {
+    open(IFH, '<', $eventfile) || die "Error opening $eventfile for reading: $!\n";
+    my @lines = <IFH>;
+    close IFH;
+    my $valname = undef;
+    grep { if (/<value name="([^"]*-[^"]*)"/) { $valname = $1; 1 } else { 0 } } @lines;
+    if (defined($valname)) {
+      die <<EOM;
+*** ERROR: The file '$eventfile' contains value names that contain the dash ('-') character, (for example, '$valname').  These are no longer allowed in XML events files.  Please run fmriqa_updatexml on '$eventfile' and any other events file that may contain these values before re-running this program.  Also make sure to update any queries to replace '-' with '_' in parameter names.
+EOM
+    };
+  }
+}
+
+if ($opt_tfiltertype) {
+  if ($opt_tfiltertype eq 'lowpass' || $opt_tfiltertype eq 'highpass') {
+    if (scalar(@opt_tfilterperiod) != 1) {
+      die "'$opt_tfiltertype' filter requires exactly one --tfilterperiod option!\n";
+    }
+  } elsif ($opt_tfiltertype eq 'bandpass' || $opt_tfiltertype eq 'bandstop') {
+    if (scalar(@opt_tfilterperiod) != 2) {
+      die "'$opt_tfiltertype' filter requires exactly two --tfilterperiod options!\n";
+    }
+  } else {
+    die "'$opt_tfiltertype' temporal filter not recognized!\n";
+  }
+}
+
+@opt_tcompare = map {
+  my ($A, $B) = @$_;
+  for my $lref (\$A, \$B) {
+    if (! grep { $_ eq $$lref } @opt_querylabels) {
+      if ($$lref =~ /[^0-9]/) {
+	die "'$$lref' is not a valid query label or index for t-test comparison\n";
+      }
+      $$lref = sprintf("%03d", $$lref);
+    }
+  }
+  [$A, $B]
+} @opt_tcompare;
+
+@opt_tcomparesummary = map {
+  my ($A, $B, $PTS) = @$_;
+  for my $lref (\$A, \$B) {
+    if (! grep { $_ eq $$lref } @opt_querylabels) {
+      if ($$lref =~ /[^0-9]/) {
+	die "'$$lref' is not a valid query label or index for t-test comparison\n";
+      }
+      $$lref = sprintf("%03d", $$lref);
+    }
+  }
+  my @groups = split(/\+/, $PTS);
+  my @ptgroups = ();
+  for my $group (@groups) {
+    push @ptgroups, [$group];
+    my @ranges = split(',', $group);
+    for my $range (@ranges) {
+      my @indices = split(':', $range);
+      if (scalar(@indices) > 2 || scalar(@indices) == 0) {
+	die "Error parsing tcomparesummary option: range '$range' must have two indices of the form X:Y\n";
+      }
+      for my $index (@indices) {
+	if ($index =~ /[^0-9]/) {
+	  die "Error parsing tcomparesummary option: index '$index' must be a number in '$group'\n";
+	}
+	$index = int($index);
+	if ($index < 0 || $index > ($opt_ptsbefore + $opt_ptsafter)) {
+	  die "Error parsing tcomparesummary option: index '$index' is not between 0 and " . ($opt_ptsbefore + $opt_ptsafter) ."\n";
+	}
+      }
+      my $firstindex = $indices[0];
+      my $lastindex = $indices[$#indices]; # if singleton, last==first
+      for (my $curindex = $firstindex; $curindex < $lastindex; $curindex++) {
+	push @{$ptgroups[$#ptgroups]}, $curindex;
+      }
+    }
+  }
+  [$A, $B, $PTS]
+} @opt_tcomparesummary;
+
+my $outputprefix = shift @ARGV;
+
+open(LOGFH, '>', "${outputprefix}_LOG.txt")
+  || die "Error opening ${outputprefix}_LOG.txt: $!\n";
+
+{
+  my @escapedcmd = quotecmd($0, (map {@$_} @optdata), $outputprefix, @ARGV);
+  print LOGFH "Command line (quoted for shell): ", join(' ', @escapedcmd), "\n";
+  print LOGFH "Command line (unquoted) BEGIN\n";
+  print LOGFH " $0\n";
+  if (scalar(@optdata) > 0) {
+    print LOGFH " ", join("\n ", map { join(" ", @$_) } @optdata), "\n";
+  }
+  print LOGFH " ", join("\n ", $outputprefix, @ARGV), "\n";
+  print LOGFH "Command line (unquoted) END\n";
+}
+
+my @featpaths = ();
+my @featfunc2avgmats = ();
+my @featfunc2outputmats = ();
+# these are the reference volumes (FLIRT's -ref parameter) originally used
+# to calculate the transformation matrices (by FEAT) for registration.  Will
+# be used to determine what was the intended output field of view.
+my @featavgreforigs = ();
+my @featoutputreforigs = ();
+# these are the -ref parameters we will use when actually applying the
+# registration transformation matrices (they will determine the output field
+# of view).
+my @featavgrefs = ();
+my @featoutputrefs = ();
+# these are for later use by another tool to transform the output images into
+# a standard space.
+my @featfunc2standardmats = ();
+my @featfuncrefs = ();
+my @feathighresrefs = ();
+my @featstandardrefs = ();
+if ($opt_featinputs) {
+  if (!defined($progflirt)) {
+    print STDERR "Can't find program flirt!\n";
+    exit -1;
+  }
+  if (!defined($progavwhd)) {
+    print STDERR "Can't find program avwhd!\n";
+    exit -1;
+  }
+  if (!defined($progavwcreatehd)) {
+    print STDERR "Can't find program avwcreatehd!\n";
+    exit -1;
+  }
+  if (!defined($progavworient)) {
+    print STDERR "Can't find program avworient!\n";
+    exit -1;
+  }
+  if (!defined($progavwswapdim)) {
+    print STDERR "Can't find program avwswapdim!\n";
+    exit -1;
+  }
+  if (!defined($proganalyze2bxh)) {
+    print STDERR "Can't find program analyze2bxh!\n";
+    exit -1;
+  }
+  if (!defined($progbxh2analyze)) {
+    print STDERR "Can't find program bxh2analyze!\n";
+    exit -1;
+  }
+  my @lastavg2output = ();
+  if (!defined($opt_featavgspace)) {
+    $opt_featavgspace = $opt_featoutputspace;
+  }
+  for (my $argnum = 0; $argnum < scalar(@ARGV); $argnum+=2) {
+    my $index = $argnum / 2;
+    my $featpath = $ARGV[$argnum];
+    $featpaths[$index] = $featpath;
+    if ($featpath !~ /.feat$/) {
+      warn "Warning: --featinputs specified, so '$featpath' was expected to end in .feat!"
+    }
+    my ($featvol, $featdirs, $featfile) = File::Spec->splitpath($featpath, 1);
+    my @featdirs = File::Spec->splitdir($featdirs);
+    my $regdirs = File::Spec->catdir(@featdirs, 'reg');
+    my $func2avgmatfile = File::Spec->catpath($featvol, $regdirs, "example_func2${opt_featavgspace}.mat");
+    my $avg2outputmatfile = File::Spec->catpath($featvol, $regdirs, "${opt_featavgspace}2${opt_featoutputspace}.mat");
+    my $func2outputmatfile = File::Spec->catpath($featvol, $regdirs, "example_func2${opt_featoutputspace}.mat");
+    my $func2standardmatfile = File::Spec->catpath($featvol, $regdirs, "example_func2standard.mat");
+    if (! -r $func2avgmatfile) {
+      die "Error: Can't find $func2avgmatfile (needed to convert from func to $opt_featavgspace space).\n";
+    }
+    if (! -r $func2outputmatfile) {
+      die "Error: Can't find $func2outputmatfile (needed to convert from func to $opt_featoutputspace space).\n";
+    }
+    if (! -r $func2standardmatfile) {
+      die "Error: Can't find $func2standardmatfile (needed to convert from func to standard space).\n";
+    }
+    @{$featfunc2avgmats[$index]} = read_feat_mat($func2avgmatfile);
+    @{$featfunc2outputmats[$index]} = read_feat_mat($func2outputmatfile);
+    @{$featfunc2standardmats[$index]} = read_feat_mat($func2standardmatfile);
+    # find required image files in the "reg" subdirectory with .nii, .nii.gz, or .hdr extensions.
+    # example_func will be used as the reference volume for the
+    # outputs of all transformations, so as to retain the same image
+    # resolution.
+    $ARGV[$argnum] = find_any_analyze_format(File::Spec->catpath($featvol, $featdirs, $opt_featdatapath));
+    $featavgreforigs[$index] = find_any_analyze_format(File::Spec->catpath($featvol, $regdirs, $opt_featavgspace));
+    $featoutputreforigs[$index] = find_any_analyze_format(File::Spec->catpath($featvol, $regdirs, $opt_featoutputspace));
+    if (File::Spec->file_name_is_absolute($opt_featavgrefvol)) {
+      $featavgrefs[$index] = $opt_featavgrefvol;
+    } else {
+      $featavgrefs[$index] = File::Spec->catpath($featvol, $regdirs, $opt_featavgrefvol);
+    }
+    $featavgrefs[$index] = find_any_analyze_format($featavgrefs[$index]);
+    if (File::Spec->file_name_is_absolute($opt_featoutputrefvol)) {
+      $featoutputrefs[$index] = $opt_featoutputrefvol;
+    } else {
+      $featoutputrefs[$index] = File::Spec->catpath($featvol, $regdirs, $opt_featoutputrefvol);
+    }
+    $featoutputrefs[$index] = find_any_analyze_format($featoutputrefs[$index]);
+    $featfuncrefs[$index] = File::Spec->catpath($featvol, $regdirs, 'example_func');
+    $featfuncrefs[$index] = find_any_analyze_format($featfuncrefs[$index]);
+    $feathighresrefs[$index] = File::Spec->catpath($featvol, $regdirs, 'highres');
+    $feathighresrefs[$index] = find_any_analyze_format($feathighresrefs[$index], 1);
+    $featstandardrefs[$index] = File::Spec->catpath($featvol, $regdirs, 'standard');
+    $featstandardrefs[$index] = find_any_analyze_format($featstandardrefs[$index], 1);
+  }
+}
+
+my @cmd;
+
+my @tempfeatfiles = ();
+if ($opt_featinputs && !$opt_extracttimingonly && !$opt_noaverage) {
+  # put input into "averaging space" (specified by $opt_featavgspace)
+  # @ARGV now contains the paths to the top-level filtered_func_data files
+  # (or whatever files specified by --featdatapath)
+  for (my $argnum = 0; $argnum < $#ARGV; $argnum+=2) {
+    my $index = $argnum / 2;
+    my $ffinput = $ARGV[$argnum];
+
+    my $avgspacebase = "${outputprefix}_avgspace${index}";
+    my $avgspacebxh = "${avgspacebase}.bxh";
+    my $avgspaceout = "${avgspacebase}.nii.gz";
+
+    my $retmat = flirt_apply_transform([\*STDOUT, \*LOGFH], $ffinput, $avgspacebase, $featavgreforigs[$index], $featavgrefs[$index], $featfunc2avgmats[$index], "${outputprefix}_func2${opt_featavgspace}${index}", $outputprefix, undef, $progflirt, $progavwhd, $progavwcreatehd, $progavwswapdim, $progavworient, $proganalyze2bxh);
+
+    # save the fixed mat for later usage
+    @{$featfunc2avgmats[$index]} = @$retmat;
+
+    push @tempfeatfiles, $avgspacebxh, $avgspaceout;
+    $ARGV[$argnum] = $avgspacebxh;
+  }
+}
+
+if ($opt_createbrainmask && !$opt_extracttimingonly && !$opt_noaverage) {
+  $opt_maskfile = "${outputprefix}_brainmask.bxh";
+  @cmd = ();
+  push @cmd, $progbrainmask;
+  push @cmd, '--overwrite' if defined($opt_overwrite);
+  push @cmd, '--method', $opt_brainmaskmethod;
+  push @cmd, '--filterorder', $opt_brainmaskorder if defined($opt_brainmaskorder);
+  push @cmd, '--filterthresh', $opt_brainmaskthresh if defined($opt_brainmaskthresh);
+  push @cmd, '--filterrank', $opt_brainmaskrank if defined($opt_brainmaskrank);
+  push @cmd, $ARGV[0];
+  push @cmd, $opt_maskfile;
+  run_cmd([\*STDOUT, \*LOGFH], @cmd);
+}
+
+my @temptfilterfiles = ();
+if ($opt_tfiltertype && !$opt_extracttimingonly && !$opt_noaverage) {
+  for (my $argnum = 0; $argnum < $#ARGV; $argnum+=2) {
+    my $index = $argnum / 2;
+    my $inputfile = $ARGV[$argnum];
+    my $tfilterbase = "${outputprefix}_tfilter${index}";
+    my $tfilterfile = "${tfilterbase}.bxh";
+    @cmd = ();
+    push @cmd, $progtfilter;
+    push @cmd, '--overwrite' if defined($opt_overwrite);
+    push @cmd, '--forcetr', $opt_forcetr if defined($opt_forcetr);
+    push @cmd, '--filtertype', $opt_tfiltertype if defined($opt_tfiltertype);
+    push @cmd, '--ripple', $opt_tfilterripple if defined($opt_tfilterripple);
+    push @cmd, '--order', $opt_tfilterorder if defined($opt_tfilterorder);
+    push @cmd, map { ('--period', $_ ) } @opt_tfilterperiod;
+    push @cmd, '--keepdc';
+    push @cmd, $inputfile;
+    push @cmd, $tfilterfile;
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+    push @temptfilterfiles, "${tfilterbase}.bxh", "${tfilterbase}.nii.gz";
+    $ARGV[$argnum] = $tfilterfile;
+  }
+}
+
+if (!$opt_noaverage) {
+  @cmd = ();
+  push @cmd, $progepochavg;
+  push @cmd, '--querylanguage', $opt_querylang if defined($opt_querylang);
+  push @cmd, map { ('--query', $_) } @opt_queries;
+  push @cmd, map { ('--queryfilter', $_) } @opt_queryfilters;
+  push @cmd, map { ('--queryepochexclude', $_) } @opt_queryepochexcludes;
+  push @cmd, map { ('--querylabel', $_) } @opt_querylabels;
+  push @cmd, '--overwrite' if defined($opt_overwrite);
+  push @cmd, '--ptsbefore', $opt_ptsbefore if defined($opt_ptsbefore);
+  push @cmd, '--ptsafter', $opt_ptsafter if defined($opt_ptsafter);
+  push @cmd, '--basestartoffset', $opt_basestart if defined($opt_basestart);
+  push @cmd, '--baseendoffset', $opt_baseend if defined($opt_baseend);
+  push @cmd, '--startpt', $opt_startpt if defined($opt_startpt);
+  push @cmd, '--endpt', $opt_startpt if defined($opt_endpt);
+  push @cmd, '--forcetr', $opt_forcetr if defined($opt_forcetr);
+  push @cmd, '--nointerp' if defined($opt_nointerp);
+  push @cmd, '--mirrorflip' if defined($opt_mirrorflip);
+  push @cmd, '--scalebl' if defined($opt_scalebl);
+  push @cmd, '--maskfile', $opt_maskfile if $opt_maskfile;
+  push @cmd, '--extracttrials' if $opt_extracttrials;
+  push @cmd, '--trialmax' if $opt_trialmax;
+  push @cmd, '--trialmaxroi', $opt_trialmaxroi if $opt_trialmaxroi;
+  push @cmd, '--trialmaxseed', $opt_trialmaxseed if $opt_trialmaxseed;
+  push @cmd, '--extracttimingonly' if $opt_extracttimingonly;
+  push @cmd, '--memorylimit', $opt_memorylimit if $opt_memorylimit;
+  push @cmd, map { ('--trialsummary', join('-', @$_)) } map { ([$_->[0], $_->[2]], [$_->[1], $_->[2]]) } @opt_tcomparesummary;
+  push @cmd, $outputprefix;
+  push @cmd, @ARGV;
+  run_cmd([\*STDOUT, \*LOGFH], @cmd);
+}
+
+if ($opt_extracttimingonly) {
+  close LOGFH;
+  exit 0;
+}
+
+if ($opt_featinputs &&
+    ($opt_featavgspace ne $opt_featoutputspace ||
+     $opt_featavgrefvol ne $opt_featoutputrefvol)) {
+  # put outputs of averaging into "output space" (specified by
+  # $opt_featoutputspace) and resolution/spacing (specified by
+  # $opt_featoutputrefvol)
+  # The mapping from "averaging space" to "output space" will be
+  # the same for every run, so just use the first run as the template.
+  # We need to create a new reference volume that has the orientation
+  # information from the original reference volume and the resolution
+  # information from the new reference volume.
+  my $outputreforig = $featoutputreforigs[0];
+  my $outputref = "${outputprefix}_${opt_featavgspace}2${opt_featoutputspace}_refvol";
+  print STDERR "Creating new refvol from template '$outputreforig' and resolution from '$featoutputrefs[0]'\n";
+  print LOGFH "Creating new refvol from template '$outputreforig' and resolution from '$featoutputrefs[0]'\n";
+  my $outputreffile = create_new_refvol($outputref, $outputreforig, $featoutputrefs[0], $progavwhd, $progavwcreatehd);
+  push @tempfeatfiles, $outputreffile;
+  my $filemetadata = readxmlmetadata($ARGV[0]);
+  my $dims = $filemetadata->{'dims'};
+  my $tspacing = $dims->{'t'}->{'spacing'}; # in ms
+  $tspacing /= 1000.0; # convert to secs
+
+#  my $initmatfile = "${outputprefix}_${opt_featavgspace}2${opt_featoutputspace}.mat";
+  # start with the inverse of the matrix used to bring the original
+  # functional data into "averaging" space (this will bring the "averaging
+  # space" data back into func space)
+  print STDERR "func2avgmat:\n", mat44_string(@{$featfunc2avgmats[0]});
+  my @avg2funcmat = affmat44_inv($featfunc2avgmats[0]);
+  print STDERR "avg2funcmat:\n", mat44_string(@avg2funcmat);
+  # now fix the "func space" to "output space" for the actual FOV we will use
+  my @func2outputmat = fix_feat_mat($featfunc2outputmats[0], $outputreforig, $outputref, $progavwhd);
+  print STDERR "func2outputmat:\n", mat44_string(@func2outputmat);
+  # now combine the two
+  my @avg2outputmat = mat44_mult(\@func2outputmat, \@avg2funcmat);
+#  write_feat_mat([\*STDERR, \*LOGFH], $initmatfile, @avg2outputmat);
+
+  my @transbases = ();
+  my $baselinebase = "${outputprefix}_baselineAvg";
+  push @transbases, [$baselinebase];
+  if ($opt_createbrainmask) {
+    my $brainmaskbase = "${outputprefix}_brainmask";
+    push @transbases, [$brainmaskbase, 'short'];
+  }
+
+  for (my $queryind = 0; $queryind < scalar(@opt_queries); $queryind++) {
+    my $querylabel = sprintf('%03d', $queryind);
+    if ($queryind < scalar(@opt_querylabels)) {
+      $querylabel = $opt_querylabels[$queryind];
+    }
+    my ($avgbase, $avgpercentbase, $stdbase, $stdpercentbase, $nbase) =
+      map { "${outputprefix}_${querylabel}_${_}" }
+	('avg', 'avg_percent', 'std', 'std_percent', 'n',
+	 ($opt_extracttrials ? 'trials' : ()));
+    push @transbases, [$avgbase], [$avgpercentbase], [$stdbase], [$stdpercentbase], [$nbase,'short'];
+  }
+
+  my %trialsummarybases = ();
+  for my $tcompsummref (@opt_tcomparesummary) {
+    my ($labelA, $labelB, $PTS) = @$tcompsummref;
+    $trialsummarybases{"${outputprefix}_${labelA}_summary_${PTS}"} = 1;
+    $trialsummarybases{"${outputprefix}_${labelB}_summary_${PTS}"} = 1;
+    push @cmd, "${outputprefix}_${labelA}_summary_${PTS}_avg.bxh";
+    push @cmd, "${outputprefix}_${labelA}_summary_${PTS}_std.bxh";
+    push @cmd, "${outputprefix}_${labelA}_summary_${PTS}_n.bxh";
+    push @cmd, "${outputprefix}_${labelB}_summary_${PTS}_avg.bxh";
+    push @cmd, "${outputprefix}_${labelB}_summary_${PTS}_std.bxh";
+    push @cmd, "${outputprefix}_${labelB}_summary_${PTS}_n.bxh";
+    push @cmd, "${outputprefix}_${labelA}_vs_${labelB}_summary_${PTS}_tmap.bxh";
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+  }
+  for my $base (keys(%trialsummarybases)) {
+    push @transbases, ["${base}_avg"];
+    push @transbases, ["${base}_std"];
+    push @transbases, ["${base}_n", 'short'];
+  }
+
+  if ($opt_trialmax) {
+    for (my $queryind = 0; $queryind < scalar(@opt_queries); $queryind++) {
+      my $querylabel = sprintf('%03d', $queryind);
+      if ($queryind < scalar(@opt_querylabels)) {
+	$querylabel = $opt_querylabels[$queryind];
+      }
+      push @transbases, ["${outputprefix}_${querylabel}_trialmax"];
+    }
+  }
+
+  for my $paramref (@transbases) {
+    my ($imgbase, $datatype) = @$paramref;
+    my $imgbxh = "${imgbase}.bxh";
+    my $imgimg = "${imgbase}.img";
+    my $tmptransbase = "${imgbase}_tmptrans";
+    @cmd = ();
+    push @cmd, $progbxh2analyze;
+    push @cmd, '--overwrite' if defined($opt_overwrite);
+    push @cmd, '--niftihdr', '-b', '-s', '-v';
+    push @cmd, $imgbxh;
+    push @cmd, $tmptransbase;
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+    unlink $imgbxh, $imgimg;
+
+    my $retmat = flirt_apply_transform([\*STDOUT, \*LOGFH], $tmptransbase, $imgbase, undef, $outputref, \@avg2outputmat, "${outputprefix}_${opt_featavgspace}2${opt_featoutputspace}", $outputprefix, $datatype, $progflirt, $progavwhd, $progavwcreatehd, $progavwswapdim, $progavworient, $proganalyze2bxh);
+
+    unlink "${tmptransbase}.hdr", "${tmptransbase}.nii.gz";
+  }
+}
+
+if ($opt_featinputs) {
+  # Calculate and store the matrix to transform output to the standard brain
+  # for later use.  Also copy the standard brain volume (needed for determining
+  # the FOV).
+
+  # calculate the matrix used to transform the functional data into
+  # output space.  Some of this may be redundant but there is no
+  # guarantee that it was done, so do it again anyway.
+  my $initmatfile = "${outputprefix}_output2standard.mat";
+  my $outputreforig = $featoutputreforigs[0];
+  # fix the "func space" to "output space" for the actual FOV we will use
+  my @func2outputmat = fix_feat_mat($featfunc2outputmats[0], $outputreforig, $featoutputrefs[0], $progavwhd);
+  print STDERR "func2outputmat:\n", mat44_string(@func2outputmat);
+  # invert it to get output to func space
+  my @output2funcmat = affmat44_inv(\@func2outputmat);
+  # now combine this with func2standard mat
+  my @output2standardmat = mat44_mult($featfunc2standardmats[0], \@output2funcmat);
+  write_feat_mat([\*STDERR, \*LOGFH], $initmatfile, @output2standardmat);
+  # copy the reference brain volume headers
+  my $funcrefvol = $featfuncrefs[0];
+  my $highresrefvol = $feathighresrefs[0];
+  my $standardrefvol = $featstandardrefs[0];
+  for my $tmpref ([$funcrefvol, 'func'], [$highresrefvol, 'highres'], [$standardrefvol, 'standard']) {
+    my ($refvol, $refname) = @$tmpref;
+    next if !defined($refvol);
+    my $hdrtxt = read_avwhd($refvol, $progavwhd);
+    my $newrefvol = "${outputprefix}_reg_${refname}";
+    write_avwhd($newrefvol, $hdrtxt, $progavwcreatehd, 'NIFTI_PAIR');
+  }
+}
+
+if (!$opt_nocorrelate) {
+  for (my $queryind = 0; $queryind < scalar(@opt_queries); $queryind++) {
+    my $tmpzero = "${outputprefix}_tmpzero";
+    my $querylabel = sprintf('%03d', $queryind);
+    if ($queryind < scalar(@opt_querylabels)) {
+      $querylabel = $opt_querylabels[$queryind];
+    }
+    @cmd = ();
+    push @cmd, $progbinop;
+    push @cmd, "${outputprefix}_${querylabel}_avg.bxh";
+    push @cmd, '--scalar=0';
+    push @cmd, '--mul';
+    push @cmd, "${tmpzero}.bxh";
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+    @cmd = ();
+    push @cmd, $progttest;
+    push @cmd, '--overwrite' if $opt_overwrite;
+    push @cmd, '--maskfile', $opt_maskfile if $opt_maskfile;
+    push @cmd, "${outputprefix}_${querylabel}_avg.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_std.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_n.bxh";
+    push @cmd, "${tmpzero}.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_std.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_n.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_zerotmap.bxh";
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+    unlink "${tmpzero}.bxh", "${tmpzero}.nii.gz";
+  }
+}
+
+if (!$opt_nocorrelate && scalar(@opt_template)) {
+  for (my $queryind = 0; $queryind < scalar(@opt_queries); $queryind++) {
+    my $querylabel = sprintf('%03d', $queryind);
+    if ($queryind < scalar(@opt_querylabels)) {
+      $querylabel = $opt_querylabels[$queryind];
+    }
+    @cmd = ();
+    push @cmd, $progcorrelate;
+    push @cmd, '--overwrite' if $opt_overwrite;
+    push @cmd, '--template', join(',', @opt_template) if scalar(@opt_template) > 0;
+    push @cmd, '--maskfile', $opt_maskfile if $opt_maskfile;
+    push @cmd, "${outputprefix}_${querylabel}_avg.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_cor.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_tmap.bxh";
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+  }
+}
+
+for my $tcompref (@opt_tcompare) {
+  my ($labelA, $labelB) = @$tcompref;
+  @cmd = ();
+  push @cmd, $progttest;
+  push @cmd, '--overwrite' if $opt_overwrite;
+  push @cmd, '--maskfile', $opt_maskfile if $opt_maskfile;
+  push @cmd, "${outputprefix}_${labelA}_avg.bxh";
+  push @cmd, "${outputprefix}_${labelA}_std.bxh";
+  push @cmd, "${outputprefix}_${labelA}_n.bxh";
+  push @cmd, "${outputprefix}_${labelB}_avg.bxh";
+  push @cmd, "${outputprefix}_${labelB}_std.bxh";
+  push @cmd, "${outputprefix}_${labelB}_n.bxh";
+  push @cmd, "${outputprefix}_${labelA}_vs_${labelB}_tmap.bxh";
+  run_cmd([\*STDOUT, \*LOGFH], @cmd);
+}
+
+for my $tcompsummref (@opt_tcomparesummary) {
+  my ($labelA, $labelB, $PTS) = @$tcompsummref;
+  $PTS =~ s/:/-/g;
+  @cmd = ();
+  push @cmd, $progttest;
+  push @cmd, '--overwrite' if $opt_overwrite;
+  push @cmd, '--maskfile', $opt_maskfile if $opt_maskfile;
+  push @cmd, "${outputprefix}_${labelA}_summary_${PTS}_avg.bxh";
+  push @cmd, "${outputprefix}_${labelA}_summary_${PTS}_std.bxh";
+  push @cmd, "${outputprefix}_${labelA}_summary_${PTS}_n.bxh";
+  push @cmd, "${outputprefix}_${labelB}_summary_${PTS}_avg.bxh";
+  push @cmd, "${outputprefix}_${labelB}_summary_${PTS}_std.bxh";
+  push @cmd, "${outputprefix}_${labelB}_summary_${PTS}_n.bxh";
+  push @cmd, "${outputprefix}_${labelA}_vs_${labelB}_summary_${PTS}_tmap.bxh";
+  run_cmd([\*STDOUT, \*LOGFH], @cmd);
+}
+
+if ($opt_trialmax) {
+  for (my $queryind = 0; $queryind < scalar(@opt_queries); $queryind++) {
+    my $querylabel = sprintf('%03d', $queryind);
+    if ($queryind < scalar(@opt_querylabels)) {
+      $querylabel = $opt_querylabels[$queryind];
+    }
+    my @templatevoxel = ();
+    if ($opt_trialmaxseed) {
+      @templatevoxel = split(/,/, $opt_trialmaxseed);
+      @templatevoxel = @templatevoxel[0..2];
+    } else {
+      open(VOXELFH, "${outputprefix}_${querylabel}_trialmaxseed.txt") ||
+	die "Error opening '${outputprefix}_${querylabel}_trialmaxseed.txt': $!\n";
+      my @voxellines = <VOXELFH>;
+      close VOXELFH;
+      @templatevoxel = split(/\s+/, "@voxellines");
+    }
+    @cmd = ();
+    push @cmd, $progcorrelate;
+    push @cmd, '--overwrite' if $opt_overwrite;
+    push @cmd, '--maskfile', $opt_maskfile if $opt_maskfile;
+    push @cmd, '--templatevoxel', join(',', @templatevoxel);
+    push @cmd, "${outputprefix}_${querylabel}_trialmax.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_trialmax_cor.bxh";
+    push @cmd, "${outputprefix}_${querylabel}_trialmax_tmap.bxh";
+    run_cmd([\*STDOUT, \*LOGFH], @cmd);
+    if (!$opt_trialmaxnodelete) {
+      unlink "${outputprefix}_${querylabel}_trialmax.bxh";
+      unlink "${outputprefix}_${querylabel}_trialmax.nii.gz";
+    }
+  }
+}
+
+map { unlink $_ } @temptfilterfiles;
+map { unlink $_ } @tempfeatfiles;
+
+close LOGFH;
+
+#
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.57  2008/07/22 17:19:09  gadde
+# Update unlinks to remove .nii.gz (rather than .img) files
+#
+# Revision 1.56  2008/02/18 21:03:49  gadde
+# Fix documentation.
+#
+# Revision 1.55  2008/02/15 21:31:09  gadde
+# Transform trial summary data to output space too!
+#
+# Revision 1.54  2007/12/06 18:48:19  gadde
+# Add single-condition t-tests (against zero); output is "_zerotmap".
+#
+# Revision 1.53  2007/10/11 14:20:32  gadde
+# Add support for FSL 4.0, and some updated sanity checks.
+#
+# Revision 1.52  2007/08/01 14:41:30  gadde
+# Remove tmptrans files after finished.
+#
+# Revision 1.51  2007/05/14 22:00:46  gadde
+# Prohibit underscores in query labels.
+#
+# Revision 1.50  2007/02/26 17:11:46  gadde
+# Print out command line before fiddling with it
+#
+# Revision 1.49  2007/02/12 21:17:37  gadde
+# add masking to correlations
+#
+# Revision 1.48  2007/01/31 22:16:09  gadde
+# Don't require highres/func/standard brains if they don't exist (for .feat directories)
+#
+# Revision 1.47  2007/01/17 17:10:46  gadde
+# Change colons to dashes when writing files (Windows [and Mac?] filenames
+# will have problems with colons).
+#
+# Revision 1.46  2007/01/16 19:55:49  gadde
+# Fix help message.
+#
+# Revision 1.45  2007/01/16 19:02:46  gadde
+# Add --trialsummary option.
+#
+# Revision 1.44  2006/10/20 17:02:17  gadde
+# Move flirt transformations to helper function
+#
+# Revision 1.43  2006/09/22 15:12:27  gadde
+# Documentation and help updates
+#
+# Revision 1.42  2006/09/22 14:19:41  gadde
+# Documentation changes
+#
+# Revision 1.41  2006/09/08 16:13:11  gadde
+# Add CVS ID as a variable.
+#
+# Revision 1.40  2006/09/06 19:35:39  gadde
+# Escape exclamation points in printed command-line arguments.
+# Add both shell-quoted and machine-readable command-line to log.
+# Store transformation matrices to convert output to standard space
+# if using .feat directories as inputs (can be used by
+# bxh_eventstats_standardize).
+#
+# Revision 1.39  2006/09/01 20:12:26  gadde
+# Delete _tmptrans files also.
+#
+# Revision 1.38  2006/09/01 19:55:40  gadde
+# Make sure to delete temp files...
+#
+# Revision 1.37  2006/09/01 19:51:26  gadde
+# Fixes to .feat support, including corrected calculation of
+# transformation matrices, plus option to specify arbitrary
+# resolution/spacing of output using --featavgrefvol and
+# --featoutputrefvol.
+#
+# Revision 1.36  2006/08/18 19:10:01  gadde
+# Additions for supporting FSL .feat directories as inputs.
+# Additional options are --featinputs, --featavgspace and --featoutputspace.
+#
+# Revision 1.35  2006/06/23 21:19:19  gadde
+# Add --extracttrials option.
+#
+# Revision 1.34  2006/05/31 19:27:29  gadde
+# Add --memorylimit option.
+#
+# Revision 1.33  2006/05/31 14:41:41  gadde
+# Add --memorylimit option.
+#
+# Revision 1.32  2006/04/14 18:14:11  gadde
+# Add --extracttimingonly option.
+#
+# Revision 1.31  2006/04/12 17:29:17  gadde
+# Win32 fixes
+#
+# Revision 1.30  2006/03/21 16:43:52  gadde
+# Add option to keep the trialmax output
+#
+# Revision 1.29  2006/03/02 21:48:12  gadde
+# Add specification of explicit trialmax seed.
+#
+# Revision 1.28  2006/02/23 17:47:48  gadde
+# Add --trialmax and --trialmaxroi options.
+#
+# Revision 1.27  2006/02/09 17:02:26  gadde
+# Update scalebl usage message.
+#
+# Revision 1.26  2006/02/08 22:08:09  gadde
+# Add --scalebl option.
+#
+# Revision 1.25  2005/11/02 15:32:02  gadde
+# Add option to select polynomial order for 'localmin' method
+#
+# Revision 1.24  2005/10/06 14:39:53  gadde
+# Add brainmask options.
+#
+# Revision 1.23  2005/09/20 18:37:55  gadde
+# Updates to versioning, help and documentation, and dependency checking
+#
+# Revision 1.22  2005/09/19 16:31:56  gadde
+# Documentation and help message updates.
+#
+# Revision 1.21  2005/09/09 20:11:00  gadde
+# Add --keepdc option to bxh_epochavg, and call it from bxh_eventstats
+#
+# Revision 1.20  2005/07/27 18:12:24  gadde
+# Forward forcetr option to bxh_tfilter.
+#
+# Revision 1.19  2005/06/02 20:43:59  gadde
+# Add tfilter options.
+#
+# Revision 1.18  2005/03/04 20:21:46  gadde
+# Give an error if we detect that any of the events files have
+# parameters whose names have dashes ('-') in them.
+# Ask them to use fmriqa_updatexml to update their XML files.
+#
+# Revision 1.17  2005/03/03 19:09:45  gadde
+# Replace query language name 'new' with 'event'.
+#
+# Revision 1.16  2005/02/25 21:50:01  gadde
+# Option-handling fixes.
+# Add --querylang option.
+#
+# Revision 1.15  2005/02/03 18:36:02  gadde
+# Allow for non-argument options in an option file
+#
+# Revision 1.14  2005/01/24 22:15:30  gadde
+# Add support for brain masking.
+# Other minor code prettiness updates.
+#
+# Revision 1.13  2005/01/20 21:54:12  gadde
+# Add --nointerp option
+#
+# Revision 1.12  2005/01/18 22:19:22  gadde
+# Add overwrite option to ttest.
+#
+# Revision 1.11  2005/01/13 20:28:09  gadde
+# Add --forcetr option.
+# Also fix behavior if an option argument was 0 (and therefore false).
+#
+# Revision 1.10  2005/01/11 22:21:43  gadde
+# Add queryfilter option.
+#
+# Revision 1.9  2005/01/05 17:19:50  gadde
+# Update help.
+#
+# Revision 1.8  2005/01/04 18:51:45  gadde
+# Add new options from bxh_epochavg.
+#
+# Revision 1.7  2004/12/17 15:35:30  gadde
+# Fix option processing.
+#
+# Revision 1.6  2004/12/14 19:37:35  gadde
+# Add log file.  Fix error messages.
+#
+# Revision 1.5  2004/12/13 19:43:57  gadde
+# Add newlines to command outputs.
+#
+# Revision 1.4  2004/12/13 19:43:19  gadde
+# Add --nocorrelate, --noaverage options.
+#
+# Revision 1.3  2004/12/13 19:24:15  gadde
+# Add --overwrite option to bxh_correlate.
+#
+# Revision 1.2  2004/12/13 19:17:37  gadde
+# Fix order of options and fix bxh_correlate --template option.
+#
+# Revision 1.1  2004/12/13 19:10:08  gadde
+# *** empty log message ***
+#
+#

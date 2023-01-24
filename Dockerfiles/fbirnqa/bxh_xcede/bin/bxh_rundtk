@@ -1,0 +1,96 @@
+#!/usr/bin/env perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use BXHPerlUtils;
+
+my $starttime = time();
+
+# This script takes an input diffusion image and runs the MGH Diffusion Toolkit
+# (DTK) on it.
+
+my $progdiffdirs;
+my $progbxh2analyze;
+my $proganalyze2bxh;
+my $progdtirecon;
+my $progdtitracker;
+my $progsplinefilter;
+
+my %exechash =
+  (
+   'extractdiffdirs' => \$progdiffdirs,
+   'bxh2analyze' => \$progbxh2analyze,
+   'analyze2bxh' => \$proganalyze2bxh,
+   'dti_recon' => \$progdtirecon,
+   'dti_tracker' => \$progdtitracker,
+   'spline_filter' => \$progsplinefilter,
+  );
+foreach my $execname (keys %exechash) {
+  ${$exechash{$execname}} = findexecutable($execname);
+}
+foreach my $execname (keys %exechash) {
+  if (!defined(${$exechash{$execname}})) {
+    print STDERR "Can't find required executable \"$execname\"!\n";
+    exit -1;
+  }
+}
+
+if (scalar(@ARGV) != 2) {
+  print STDERR <<EOM;
+ERROR: two arguments required: inputfile outputprefix
+inputfile is a diffusion image in .bxh or XCEDE format.
+All output filenames will start with outputprefix.  outputprefix may
+contain directory names.  If outputprefix is an existing directory,
+or ends in '/', files will be written to that directory."
+EOM
+  exit -1;
+}
+
+my $inputfile = shift;
+my $outputprefix = shift;
+my $dtkprefix = $outputprefix;
+if (-d $outputprefix || $outputprefix =~ m%/$%) {
+  mkdir $outputprefix;
+  $dtkprefix = "${outputprefix}/dtk";
+  $outputprefix = "${outputprefix}/dtk_";
+} else {
+  $outputprefix = "${outputprefix}_";
+}
+
+my $logfh = undef;
+open($logfh, '>', "${outputprefix}LOG.txt") || die "Error opening '${outputprefix}LOG.txt' for writing: $!\n";
+
+print $logfh "START: ", scalar(localtime($starttime)), "\n";
+
+run_cmd([$logfh], $progdiffdirs, '--overwrite', '--dtk', $inputfile, "${outputprefix}gradients.txt");
+
+run_cmd([$logfh], $progbxh2analyze, '--overwrite', '--niigz', $inputfile, "${outputprefix}input");
+
+##run dtk
+run_cmd([$logfh], $progdtirecon, "${outputprefix}input", "${dtkprefix}", '-gm', "${outputprefix}gradients.txt", '-ot', 'nii');
+run_cmd([$logfh], $progdtitracker, "${dtkprefix}", "${dtkprefix}_unfiltered.trk", '-at', '35', '-m', "${dtkprefix}_dwi.nii", '-it', 'nii');
+run_cmd([$logfh], $progsplinefilter, "${dtkprefix}_unfiltered.trk", '1', "${dtkprefix}_filtered.trk");
+
+for my $img ('fa', 'tensor', 'exp', 'b0', 'adc', 'dwi', 'e1', 'e2', 'e3', 'v1', 'v2', 'v3') {
+  run_cmd([$logfh], $proganalyze2bxh, "${outputprefix}${img}.nii", "${outputprefix}${img}.bxh");
+}
+
+my $endtime = time();
+print $logfh "END: ", scalar(localtime($endtime)), "\n";
+
+my $runtime = $endtime - $starttime;
+my $runsecs = $runtime % 60;
+my $runmins = int($runtime / 60) % 60;
+my $runhours = int($runtime / (60 * 60));
+print $logfh "Run time: ${runhours}h ${runmins}m ${runsecs}s\n";
+
+close $logfh;
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.1  2009/04/08 17:20:16  gadde
+# Initial import.
+#
+

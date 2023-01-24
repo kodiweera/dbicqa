@@ -1,0 +1,829 @@
+#!/usr/bin/perl -w
+
+my $rcsid = '$Id: bxh_eventstats_combine,v 1.24 2008-04-21 16:59:36 gadde Exp $ ';
+
+use strict;
+
+use File::Spec;
+use File::Path;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use File::Copy;
+
+use BXHPerlUtils;
+
+sub wait_for_processes {
+  my ($procsref, $maxprocs) = @_;
+#  print STDOUT "Waiting for process list to have less than $maxprocs values: ", join(", ", @$procsref), "\n";
+  while (@$procsref >= $maxprocs) {
+    my $child = wait;
+    my $status = $?;
+    my $exitval = $? >> 8;
+    my $signal = $? & 127;
+    if (($? >> 8) != 0) {
+      die "ERROR: Child process $child returned with exit value $exitval" . ($signal ? ", and signal $signal" : "") . "\n";
+    }
+    @$procsref = grep { $_ != $child } @$procsref;
+#    print STDOUT "  process list now: ", join(", ", @$procsref), "\n";
+  }
+};
+
+sub fork_and_run_cmd {
+  my $child = fork();
+  return undef if !defined($child);
+  if ($child == 0) {
+    if (!defined(eval { run_cmd(@_) })) {
+      print STDERR $@;
+    }
+    exit($? >> 8);
+  }
+  return $child;
+};
+
+# extract the original command line from the log file.
+# Each argument (or option plus argument) gets put in a separate list,
+# and an array of references to these lists are returned.
+sub read_cmd_line_from_log {
+  my @cmdline = ();
+  my ($logfile,) = @_;
+  open(FH, $logfile) || die "Error opening '$logfile': $!\n";
+  my $foundbegin = 0;
+  while (<FH>) {
+    /^Command line \(unquoted\) BEGIN$/ && do { $foundbegin = 1; last };
+  }
+  if (!$foundbegin) {
+    die "Didn't find command-line in log file '$logfile'\n";
+  }
+  while (<FH>) {
+    chomp;
+    last if /^Command line \(unquoted\) END$/;
+    my ($arg, undef, $optarg) = /^ ([^ ]*)( (.*))?$/;
+    push @cmdline, [$arg, defined($optarg) ? $optarg : ()];
+  }
+  close FH;
+  return @cmdline;
+}
+
+my $usage = <<EOM;
+Usage:
+  bxh_eventstats_combine [--maxprocs N] [--notstandardized] eventstatsprefixes... outputprefix
+  bxh_eventstats_combine [--maxprocs N] [--notstandardized] [--groupcompare group1-group2]... --useprefixfile prefixfile outputprefix
+
+This program combines the outputs of one or more runs of bxh_eventstats, found
+by interpreting the options recorded in the bxh_eventstats log files.
+There are two ways to specify inputs to this program.  First is to specify
+all the prefixes used as the base name for the bxh_eventstats outputs you
+wish to combine.  Alternatively, you can specify the prefixes in a file,
+and provide it as the argument to the --useprefixfile option.  In both cases,
+the last argument should be the output prefix to use for writing aggregate
+statistics. The --useprefixfile option also allows you to specify multiple
+optional groupings of the inputs, each grouping being calculated independently.
+Here is an example:
+
+  #prefix bydiagnosis bysite
+  /data/dir/study1/es healthy site1
+  /data/dir/study2/es healthy site2
+  /data/dir/study3/es schizophrenic site2
+  /data/dir/study4/es schizophrenic site1
+
+Each column in the file is an "axis".  The first line, which must start with
+a comment character ('#'), is essential to name the axes/columns (the name of
+the first column, representing the prefix, is arbitrary and ignored).  Each
+subsequent line must be a prefix followed by the name of the group within each
+axis.  These group names must be unique across all groups.
+
+The --groupcompare option (which can be specified multiple times) allows you
+to do a group comparison between two groups that are specified in the same
+column (like healthy-schizophrenic or site1-site2).  All group statistics are
+written to a directory named by outputprefix_groups.
+
+Within the full aggregate statistics or each group, all the _avg.bxh files
+and _avg_percent.bxh files will be combined with a simple average, and all
+the _tmap.bxh files will be combined with both a t-test against zero and
+a weighted-z method (the output filenames will include 'zerottest' or
+'weightedz').
+
+By default, this program uses the "standardized" versions of eventstats
+output (as produced by bxh_eventstats_standardize).  If --notstandardized is
+specified, then it will use the original files (useful if you originally ran
+eventstats on data that has already been registered to a common space).
+EOM
+
+my $progmean = findexecutable("bxh_mean");
+my $progunop = findexecutable("bxh_unop");
+my $progbinop = findexecutable("bxh_binop");
+my $progselect = findexecutable("bxhselect");
+my $progttest = findexecutable("bxh_ttest");
+my $progminmax = findexecutable("fmriqa_minmax");
+if (!defined($progmean)) {
+  print STDERR "Can't find program bxh_mean!\n";
+  exit -1;
+}
+if (!defined($progunop)) {
+  print STDERR "Can't find program bxh_unop!\n";
+  exit -1;
+}
+if (!defined($progbinop)) {
+  print STDERR "Can't find program bxh_binop!\n";
+  exit -1;
+}
+if (!defined($progselect)) {
+  print STDERR "Can't find program bxhselect!\n";
+  exit -1;
+}
+if (!defined($progttest)) {
+  print STDERR "Can't find program bxh_ttest!\n";
+  exit -1;
+}
+if (!defined($progminmax)) {
+  print STDERR "Can't find program fmriqa_minmax!\n";
+  exit -1;
+}
+
+my $opt_standardized = '_standardized';
+my $opt_prefixfile = undef;
+my @opt_groupcompares = ();
+my $opt_maxprocs = 1;
+my $opt_skipweightedz = 0;
+
+my @savedARGV = @ARGV;
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+my @optdata = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    push @optdata, ["--"];
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)(.*))?$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  my $usedoptarg = 0;
+  if ($opt eq 'help') {
+    print STDERR $usage;
+    exit(-1);
+  } elsif ($opt eq 'notstandardized' && !defined($opteq)) {
+    $opt_standardized = '';
+  } elsif ($opt eq 'useprefixfile' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_prefixfile = $optarg;
+  } elsif ($opt eq 'maxprocs' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_maxprocs = $optarg;
+  } elsif ($opt eq 'groupcompare' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    my @groups = split(/-/, $optarg);
+    if (@groups != 2) {
+      die "Error: argument to --groupcompare must have the form group1-group2\n";
+    }
+    push @opt_groupcompares, [@groups];
+  } elsif ($opt eq 'skipweightedz' && !defined($opteq)) {
+    $opt_skipweightedz++;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+  push @optdata, ["--" . $opt, $usedoptarg ? $optarg : ()];
+}
+
+if ((defined($opt_prefixfile) && scalar(@ARGV) != 1) ||
+    (!defined($opt_prefixfile) && scalar(@ARGV) < 2)) {
+  die "Wrong number of arguments!\n$usage\n"
+}
+
+if ($opt_maxprocs < 1) {
+  die "--maxprocs must be greater than 0!\n";
+}
+
+my $newprefix = pop @ARGV;
+my @prefixes = @ARGV;
+my %axis2group = ();
+my %group2axis = ();
+my @groupsources = ();
+my %groupprefixes = ();
+my %groupcompareprefixes = ();
+
+# '' is the axis and single group comprised of all inputs
+$groupprefixes{''}->{''} = $newprefix;
+
+if (defined($opt_prefixfile)) {
+  my @axisnames = ();
+  open(FH, $opt_prefixfile) || die "Error opening '$opt_prefixfile': $!\n";
+  my $isfirstline = 1;
+  while (<FH>) {
+    s/\s+$//;
+    s/^\s+//;
+    if ($isfirstline && /^#/) {
+      s/^#\s*//;
+      @axisnames = split(/\s+/, $_);
+      shift @axisnames; # get rid of first entry (prefix)
+      next;
+    }
+    next if /^$/;
+    if (scalar(@axisnames) == 0) {
+      push @prefixes, $_;
+      push @groupsources, [$_, [['','']]];
+      next;
+    }
+    my ($prefix, @groupnamelist) = split(/\s+/, $_);
+    push @prefixes, $prefix;
+    if (scalar(@groupnamelist) != scalar(@axisnames)) {
+      die "Error: number of columns in the following line:\n $_\ndoes not have the right number of entries!\n(expecting an entry for each of: " . join(" ", 'prefix', @axisnames) . "\n";
+    }
+    my @grouplist = (['', '']); # initialize with full group ids
+    for my $axisind (0..$#axisnames) {
+      my $axisname = $axisnames[$axisind];
+      my $groupname = $groupnamelist[$axisind];
+      next if $groupname eq 'IGNORE';
+      my ($vol, $dirs, $file) = File::Spec->splitpath($newprefix);
+      my $groupdir = "${newprefix}_groups/${axisname}/${groupname}";
+      if (! -d $groupdir) {
+	mkpath($groupdir);
+      }
+      my $groupprefix = "${groupdir}/${file}";
+      $groupprefixes{$axisname}->{$groupname} = $groupprefix;
+      push @grouplist, [$axisname, $groupname];
+      $axis2group{$axisname}->{$groupname} = 1;
+      if (exists $group2axis{$groupname} &&
+	  $group2axis{$groupname} ne $axisname) {
+	  die "Error: group '$groupname' exists in axes '$axisname' and '$group2axis{$groupname}'\n";
+      }
+      $group2axis{$groupname} = $axisname;
+    }
+    push @groupsources, [$prefix, [@grouplist]];
+  }
+  close FH;
+} else {
+  for my $prefix (@prefixes) {
+    push @groupsources, [$prefix, [['','']]];
+  }
+}
+
+for my $gcentry (@opt_groupcompares) {
+    my ($group1, $group2) = @$gcentry;
+    if (!exists($group2axis{$group1})) {
+      die "Error: group '$group1' (specified in --groupcompare) does not exist?\n";
+    }
+    if (!exists($group2axis{$group2})) {
+      die "Error: group '$group1' (specified in --groupcompare) does not exist?\n";
+    }
+    my $axisname = $group2axis{$group1};
+    if ($axisname ne $group2axis{$group2}) {
+      die "Error: group '$group1' and group '$group2' are not in the same axis!\n";
+    }
+    my ($vol, $dirs, $file) = File::Spec->splitpath($newprefix);
+    my $gcdir = "${newprefix}_groups/${axisname}/${group1}_vs_${group2}";
+    if (! -d $gcdir) {
+	mkpath($gcdir);
+    }
+    my $gcprefix = "${gcdir}/${file}";
+    $groupcompareprefixes{"${group1}_vs_${group2}"} = $gcprefix;
+}
+
+my @cmdlineargs = map { [read_cmd_line_from_log($_ . '_LOG.txt')] } @prefixes;
+
+my @querylabels = map {
+  my @cmdline = @$_;
+  my @labels = map { $_->[1] } grep { $_->[0] eq '--querylabel' } @cmdline;
+  if (scalar(@labels) == 0) {
+    my $numqueries = grep { $_->[0] eq '--query' } @cmdline;
+    @labels = map { sprintf("%03d",$_) } (0..$numqueries-1);
+  }
+  map {
+    /_/ && die "Query labels can not contain underscores!  (found '$_')\n";
+  } @labels;
+  \@labels;
+} @cmdlineargs;
+
+map {
+  if (! scalar(grep { $_->[0] eq '--createbrainmask' } @$_)) {
+    die "ERROR: Did not find required brain mask in at least one input.\nDid you forget to run bxh_eventstats with --createbrainmask?\n";
+  }
+} @cmdlineargs;
+
+my @didtmaps = map {
+  scalar(grep { $_->[0] eq '--template' } @$_) > 0
+} @cmdlineargs;
+
+my @tcompares = map {
+  my @cmdline = @$_;
+  my @lists = map { [split('-',$_->[1])] } grep { $_->[0] eq '--tcompare' } @cmdline;
+  my $errors = grep {
+    if (scalar(@$_) != 2) {
+      print STDERR "'", join('-', @$_), "' isn't of the form LABEL1-LABEL2!\n";
+    }
+  } @lists;
+  die "Aborting.\n" if $errors;
+  \@lists;
+} @cmdlineargs;
+
+my @tcomparesummaries = map {
+  my @cmdline = @$_;
+  my @lists = map { [split('-',$_->[1])] } grep { $_->[0] eq '--tcomparesummary' } @cmdline;
+  my $errors = grep {
+    if (scalar(@$_) != 3) {
+      print STDERR "'", join('-', @$_), "' isn't of the form LABEL1-LABEL2-PTS!\n";
+    }
+  } @lists;
+  die "Aborting.\n" if $errors;
+  \@lists;
+} @cmdlineargs;
+
+# first do simple aggregate statistics
+# these lists associate each output file to the list of input files
+# that will be used to compute them.
+my %sums = ();
+my %averages = ();
+my %tmaps = ();
+my %tmapsources = ();
+my %groupcomparetmaps = ();
+for my $ind (0..$#groupsources) {
+  my ($prefix, $grouplistref) = @{$groupsources[$ind]};
+  my @grouplist = @$grouplistref;
+  my @sumbases = ();
+  my @avgbases = ();
+  my @tmapbases = ();
+  push @sumbases, map {
+    my $querylabel = $_;
+    map
+      { "${querylabel}_${_}" }
+      ('n')
+  } @{$querylabels[$ind]};
+  push @sumbases, "brainmask";
+  push @avgbases, 'baselineAvg';
+  push @avgbases, map {
+    my $querylabel = $_;
+    map
+      { "${querylabel}_${_}" }
+      ('avg', 'avg_percent', 'std', 'std_percent')
+  } @{$querylabels[$ind]};
+  push @tmapbases, map {
+    my $querylabel = $_;
+    map
+      { "${querylabel}_${_}" }
+      ($didtmaps[$ind] ? ('tmap') : ());
+  } @{$querylabels[$ind]};
+  push @tmapbases, map {
+    my ($label1, $label2) = @$_;
+    "${label1}_vs_${label2}_tmap"
+  } @{$tcompares[$ind]};
+  my %tcomparesummarybases = ();
+  map {
+    my ($label1, $label2, $PTS) = @$_;
+    $PTS =~ s/:/-/g;
+    $tcomparesummarybases{"${label1}_summary_${PTS}"} = 1;
+    $tcomparesummarybases{"${label2}_summary_${PTS}"} = 1;
+  } @{$tcomparesummaries[$ind]};
+  push @sumbases, map {
+    "${_}_n"
+  } keys %tcomparesummarybases;
+  push @avgbases, map {
+    ("${_}_avg",
+     "${_}_std")
+  } keys %tcomparesummarybases;
+  push @tmapbases, map {
+    my ($label1, $label2, $PTS) = @$_;
+    $PTS =~ s/:/-/g;
+    "${label1}_vs_${label2}_summary_${PTS}_tmap"
+  } @{$tcomparesummaries[$ind]};
+  for my $listref (\@sumbases, \@avgbases, \@tmapbases) {
+    @{$listref} = grep {
+      my $name = $_;
+      my $oldfilename = "${prefix}${opt_standardized}_${name}.bxh";
+      if (-r $oldfilename) {
+	1;
+      } else {
+	print STDERR "Warning: ignoring non-existent/unreadable file '$oldfilename'.\n";
+	0;
+      }
+    } @{$listref};
+  }
+  for my $axisgroupref (@grouplist) {
+    my ($axisname, $groupname) = @$axisgroupref;
+    my $groupprefix = $groupprefixes{$axisname}->{$groupname};
+    for my $base (@sumbases) {
+      push @{$sums{"${groupprefix}${opt_standardized}_${base}"}}, "${prefix}${opt_standardized}_${base}.bxh";
+    }
+    for my $base (@avgbases) {
+      push @{$averages{"${groupprefix}${opt_standardized}_${base}"}}, "${prefix}${opt_standardized}_${base}.bxh";
+    }
+    for my $base (@tmapbases) {
+      my $newbase = "${groupprefix}${opt_standardized}_${base}";
+      $tmaps{$newbase}->[0] = $groupprefix;
+      push @{$tmaps{$newbase}->[1]}, "${prefix}${opt_standardized}_${base}.bxh";
+      push @{$tmapsources{"${prefix}${opt_standardized}_${base}"}}, $newbase;
+    }
+    for my $gcentry (grep { grep { $_ eq $groupname } @$_ } @opt_groupcompares) {
+      my ($group1, $group2) = @$gcentry;
+      my $gcprefix = $groupcompareprefixes{"${group1}_vs_${group2}"};
+      for my $base (@tmapbases) {
+	my $newbase = "${gcprefix}${opt_standardized}_${base}";
+	my $realbase = $newbase;
+	$realbase =~ s/_tmap//;
+	$groupcomparetmaps{$newbase}->[0] = $base;
+	if ($groupname eq $group1) {
+	  push @{$groupcomparetmaps{$newbase}->[1]}, "${prefix}${opt_standardized}";
+	} elsif ($groupname eq $group2) {
+	  push @{$groupcomparetmaps{$newbase}->[2]}, "${prefix}${opt_standardized}";
+	}
+      }
+    }
+  }
+}
+
+my $foundexisting = 0;
+for my $base (keys %sums) {
+  for my $ext ('bxh', 'nii.gz') {
+    if (-f "${base}.${ext}") {
+      print STDERR "Error: ${base}.${ext} exists!\n";
+      $foundexisting = 1;
+    }
+  }
+}
+for my $base (keys %averages) {
+  for my $ext ('bxh', 'nii.gz') {
+    if (-f "${base}.${ext}") {
+      print STDERR "Error: ${base}.${ext} exists!\n";
+      $foundexisting = 1;
+    }
+  }
+}
+for my $base (keys %tmaps) {
+  for my $combinetype ('zerottest', ($opt_skipweightedz ? () : 'weightedz')) {
+    for my $ext ('bxh', 'nii.gz') {
+      if (-f "${base}_${combinetype}.${ext}") {
+	print STDERR "Error: ${base}_zerottest.${ext} exists!\n";
+	$foundexisting = 1;
+      }
+    }
+  }
+}
+if ($foundexisting) {
+  exit(-1);
+}
+
+my @procs = ();
+
+for my $base (keys %sums) {
+  wait_for_processes(\@procs, $opt_maxprocs);
+  push @procs, fork_and_run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', '--sumonly', @{$sums{$base}}, "${base}.bxh");
+}
+
+for my $base (keys %averages) {
+  wait_for_processes(\@procs, $opt_maxprocs);
+  push @procs, fork_and_run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', @{$averages{$base}}, "${base}.bxh");
+}
+
+wait_for_processes(\@procs, 1);
+
+# do the t-test against zero
+for my $base (keys %tmaps) {
+  wait_for_processes(\@procs, $opt_maxprocs);
+
+  my $child = fork();
+  die "Error: fork(): $!\n" if !defined($child);
+  if ($child == 0) {
+    my $tmpmeanbxh = "${newprefix}_tmpmean_$$.bxh";
+    my $tmpmeanimg = "${newprefix}_tmpmean_$$.nii.gz";
+    my $tmpstddevbxh = "${newprefix}_tmpstddev_$$.bxh";
+    my $tmpstddevimg = "${newprefix}_tmpstddev_$$.nii.gz";
+    my $tmpzerobxh = "${newprefix}_tmpzero_$$.bxh";
+    my $tmpzeroimg = "${newprefix}_tmpzero_$$.nii.gz";
+    my $tmpnbxh = "${newprefix}_tmpn_$$.bxh";
+    my $tmpnimg = "${newprefix}_tmpn_$$.nii.gz";
+    my @tmpfiles = ($tmpmeanbxh, $tmpmeanimg,
+		    $tmpstddevbxh, $tmpstddevimg,
+		    $tmpzerobxh, $tmpzeroimg,
+		    $tmpnbxh, $tmpnimg);
+    unlink @tmpfiles;
+    my ($summarysuffix, undef) = ($base =~ /((_summary_[^_]+)?)_tmap$/);
+    my ($conditions,) = ($base =~ /([^_]+(_vs_[^_]+)?)\Q${summarysuffix}\E_tmap$/);
+    my ($realprefix,) = ($base =~ /(.*)_\Q${conditions}${summarysuffix}\E_tmap$/);
+
+    # do the simple t-test of t-tests, against zero
+    run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', '--stddev', $tmpstddevbxh, @{$tmaps{$base}->[1]}, $tmpmeanbxh);
+    # create fake zero image to do a t-test of t-tests against 0
+    run_cmd([\*STDOUT], $progbinop, '--mul', '--scalar', 0, $tmpmeanbxh, $tmpzerobxh);
+    # fake N image
+    my $groupmaskbase = "${realprefix}_brainmask";
+    run_cmd([\*STDOUT], $progbinop, '--add', $tmpzerobxh, "${groupmaskbase}.bxh", $tmpnbxh);
+    # do the t-test
+    run_cmd([\*STDOUT], $progttest, '--mask', "${groupmaskbase}.bxh", $tmpmeanbxh, $tmpstddevbxh, $tmpnbxh, $tmpzerobxh, $tmpzerobxh, $tmpnbxh, "${base}_zerottest.bxh");
+    unlink @tmpfiles;
+    exit;
+  } else {
+    push @procs, $child;
+  }
+}
+
+if (!$opt_skipweightedz) {
+  wait_for_processes(\@procs, 1);
+
+  # do generalized Stouffer's method, as described in:
+  #  M. C. Whitlock, "Combining probability from independent tests: the
+  #  weighted Z-method is superior to Fisher's approach", Journal of
+  #  Evolutionary Biology, 18 (2005) 1368-1373.
+  #
+  #        Sum[i=1:k][wi*Zi]
+  #  Zw = --------------------
+  #          ________________
+  #        \/Sum[i=1:k][wi^2]
+
+  # generate temporary filenames for each output tmap
+  my %tmaptmpfiles = ();
+  for my $base (keys %tmaps) {
+    my $tmpprefix = $base;
+    $tmaptmpfiles{$base} =
+    {
+      'numaccum1bxh' => "${tmpprefix}_tmpnumaccumA.bxh",
+      'numaccum1img' => "${tmpprefix}_tmpnumaccumA.nii.gz",
+      'denaccum1bxh' => "${tmpprefix}_tmpdenaccumA.bxh",
+      'denaccum1img' => "${tmpprefix}_tmpdenaccumA.nii.gz",
+      'numaccum2bxh' => "${tmpprefix}_tmpnumaccumB.bxh",
+      'numaccum2img' => "${tmpprefix}_tmpnumaccumB.nii.gz",
+      'denaccum2bxh' => "${tmpprefix}_tmpdenaccumB.bxh",
+      'denaccum2img' => "${tmpprefix}_tmpdenaccumB.nii.gz",
+      'denbxh' => "${tmpprefix}_tmpden.bxh",
+      'denimg' => "${tmpprefix}_tmpden.nii.gz",
+      'Zwbxh' => "${tmpprefix}_tmpZw.bxh",
+      'Zwimg' => "${tmpprefix}_tmpZw.nii.gz",
+      'pbxh' => "${tmpprefix}_tmpp.bxh",
+      'pimg' => "${tmpprefix}_tmpp.nii.gz",
+    };
+    unlink values %{$tmaptmpfiles{$base}};
+  }
+  # now go through all the tmap prefixes, calculate wi*Zi and wi*wi, and
+  # add them to the appropriate numerators/denominators
+  for my $sourcetmap (keys %tmapsources) {
+    my @tmaptargets = @{$tmapsources{$sourcetmap}};
+    my $tmpnbxh = "${sourcetmap}_tmpn.bxh";
+    my $tmpnimg = "${sourcetmap}_tmpn.nii.gz";
+    my $tmpwiauxbxh = "${sourcetmap}_tmpwiaux.bxh";
+    my $tmpwiauximg = "${sourcetmap}_tmpwiaux.nii.gz";
+    my $tmpwibxh = "${sourcetmap}_tmpwi.bxh";
+    my $tmpwiimg = "${sourcetmap}_tmpwi.nii.gz";
+    my $tmpZibxh = "${sourcetmap}_tmpZi.bxh";
+    my $tmpZiimg = "${sourcetmap}_tmpZi.nii.gz";
+    my $tmpwiZibxh = "${sourcetmap}_tmpwiZi.bxh";
+    my $tmpwiZiimg = "${sourcetmap}_tmpwiZi.nii.gz";
+    my $tmpwiwibxh = "${sourcetmap}_tmpwiwi.bxh";
+    my $tmpwiwiimg = "${sourcetmap}_tmpwiwi.nii.gz";
+    my @tmpfiles =
+	($tmpnbxh, $tmpnimg,
+	 $tmpwiauxbxh, $tmpwiauximg,
+	 $tmpwibxh, $tmpwiimg,
+	 $tmpZibxh, $tmpZiimg,
+	 $tmpwiZibxh, $tmpwiZiimg,
+	 $tmpwiwibxh, $tmpwiwiimg);
+    unlink @tmpfiles;
+
+    my ($summarysuffix, undef) = ($sourcetmap =~ /((_summary_[^_]+)?)_tmap$/);
+    my ($conditions,) = ($sourcetmap =~ /([^_]+(_vs_[^_]+)?)\Q${summarysuffix}\E_tmap$/);
+    my ($realprefix,) = ($sourcetmap =~ /(.*)_\Q${conditions}${summarysuffix}\E_tmap$/);
+    my @conditions = split(/_vs_/, $conditions);
+    my $mask = "${realprefix}_brainmask.bxh";
+    if (scalar(@conditions) == 1) {
+      my $n = "${realprefix}_${conditions}${summarysuffix}_n.bxh";
+      run_cmd([\*STDOUT], $progselect, '--timeselect', '0', $n, $tmpnbxh);
+      run_cmd([\*STDOUT], $progbinop, '--mask', $mask, '--sub', '--scalar', '2', $tmpnbxh, $tmpwibxh);
+    } elsif (scalar(@conditions) == 2) {
+      my $n1 = "${realprefix}_$conditions[0]${summarysuffix}_n.bxh";
+      my $n2 = "${realprefix}_$conditions[1]${summarysuffix}_n.bxh";
+      run_cmd([\*STDOUT], $progbinop, '--sub', '--scalar', '2', $n1, $tmpwiauxbxh);
+      run_cmd([\*STDOUT], $progbinop, '--mask', $mask, '--add', $tmpwiauxbxh, $n2, $tmpwibxh);
+    } else {
+      die "Don't understand " . scalar(@conditions) . " number of conditions in  ${realprefix}_${conditions}${summarysuffix}\n";
+    }
+    print STDERR "$sourcetmap\n";
+    print STDERR " w_i ", `$progminmax $tmpwibxh`;
+    # Zi
+    run_cmd([\*STDOUT], $progunop, '--mask', $mask, '--nifticode', 'TTEST', '--niftiopt', 'z', '--niftiparamfile1', $tmpwibxh, "${sourcetmap}.bxh", $tmpZibxh);
+    print STDERR " Z_i ", `$progminmax $tmpZibxh`;
+    # wi*Zi
+    run_cmd([\*STDOUT], $progbinop, '--mask', $mask, '--mul', $tmpwibxh, $tmpZibxh, $tmpwiZibxh);
+    print STDERR " w_i * Z_i ", `$progminmax $tmpwiZibxh`;
+    # wi*wi
+    run_cmd([\*STDOUT], $progbinop, '--mask', $mask, '--mul', $tmpwibxh, $tmpwibxh, $tmpwiwibxh);
+    print STDERR " w_i * w_i ", `$progminmax $tmpwiwibxh`;
+
+    # add these to the sums in the numerators and denominators for the
+    # groups this is involved in
+    for my $tmapbase (@tmaptargets) {
+      my $tmpfls = $tmaptmpfiles{$tmapbase};
+      if (-e $tmpfls->{'numaccum1bxh'}) {
+	run_cmd([\*STDOUT], $progbinop, '--add', $tmpwiZibxh, $tmpfls->{'numaccum1bxh'}, $tmpfls->{'numaccum2bxh'});
+	run_cmd([\*STDOUT], $progbinop, '--add', $tmpwiwibxh, $tmpfls->{'denaccum1bxh'}, $tmpfls->{'denaccum2bxh'});
+      } else {
+	run_cmd([\*STDOUT], $progbinop, '--add', '--scalar', 0, $tmpwiZibxh, $tmpfls->{'numaccum2bxh'});
+	run_cmd([\*STDOUT], $progbinop, '--add', '--scalar', 0, $tmpwiwibxh, $tmpfls->{'denaccum2bxh'});
+      }
+      # swap accum files
+      my $swap = undef;
+      $swap = $tmpfls->{'numaccum2bxh'};
+      $tmpfls->{'numaccum2bxh'} = $tmpfls->{'numaccum1bxh'};
+      $tmpfls->{'numaccum1bxh'} = $swap;
+      $swap = $tmpfls->{'numaccum2img'};
+      $tmpfls->{'numaccum2img'} = $tmpfls->{'numaccum1img'};
+      $tmpfls->{'numaccum1img'} = $swap;
+      $swap = $tmpfls->{'denaccum2bxh'};
+      $tmpfls->{'denaccum2bxh'} = $tmpfls->{'denaccum1bxh'};
+      $tmpfls->{'denaccum1bxh'} = $swap;
+      $swap = $tmpfls->{'denaccum2img'};
+      $tmpfls->{'denaccum2img'} = $tmpfls->{'denaccum1img'};
+      $tmpfls->{'denaccum1img'} = $swap;
+      # post-condition: $tmpfls->{'numaccum1bxh'} and tmpfls->{'denaccum1bxh'}
+      # have the current value of the accumulators
+      unlink $tmpfls->{'numaccum2bxh'};
+      unlink $tmpfls->{'numaccum2img'};
+      unlink $tmpfls->{'denaccum2bxh'};
+      unlink $tmpfls->{'denaccum2img'};
+      print STDERR " tmaptarget: $tmapbase\n";
+      print STDERR "  numerator_i ", `$progminmax $tmpfls->{'numaccum1bxh'}`;
+      print STDERR "  denominator_i ", `$progminmax $tmpfls->{'denaccum1bxh'}`;
+    }
+    unlink @tmpfiles;
+  }
+
+  for my $targettmap (keys %tmaps) {
+    my $groupprefix = $tmaps{$targettmap}->[0];
+    my $tmpfls = $tmaptmpfiles{$targettmap};
+    my ($summarysuffix, undef) = ($targettmap =~ /((_summary_[^_]+)?)_tmap$/);
+    my ($conditions,) = ($targettmap =~ /([^_]+(_vs_[^_]+)?)\Q${summarysuffix}\E_tmap$/);
+    my ($realprefix,) = ($targettmap =~ /(.*)_\Q${conditions}${summarysuffix}\E_tmap$/);
+    print STDERR "$targettmap\n";
+    # numerator is in tmpfls->{'numaccum1bxh'}
+    # denominator is in tmpfls->{'denaccum1bxh'}
+    # finish calculating denominator: sqrt(sum(wi*wi))
+    run_cmd([\*STDOUT], $progunop, '--mask', "${groupprefix}${opt_standardized}_brainmask.bxh", '--sqrt', $tmpfls->{'denaccum1bxh'}, $tmpfls->{'denbxh'});
+    print STDERR " sqrt(denominator_i)=", `$progminmax $tmpfls->{'denbxh'}`;
+
+    # divide
+    run_cmd([\*STDOUT], $progbinop, '--mask', "${groupprefix}${opt_standardized}_brainmask.bxh", '--div', $tmpfls->{'numaccum1bxh'}, $tmpfls->{'denbxh'}, $tmpfls->{'Zwbxh'});
+    print STDERR " Z_w=", `$progminmax $tmpfls->{'Zwbxh'}`;
+
+    # we have Zw, now convert it to a p
+    run_cmd([\*STDOUT], $progunop, '--mask', "${groupprefix}${opt_standardized}_brainmask.bxh", '--niftiopt', 'p', '--nifticode', 'NORMAL', '--niftiparam1', '0', '--niftiparam2', '1', $tmpfls->{'Zwbxh'}, "${realprefix}_${conditions}${summarysuffix}_pmap_weightedz.bxh");
+
+    unlink values %$tmpfls;
+  }
+  # remove tmp files from tmaps
+  for my $base (keys %tmaps) {
+    unlink values %{$tmaptmpfiles{$base}};
+  }
+}
+
+# now do group comparisons
+for my $groupcomparetmap (keys %groupcomparetmaps) {
+  my $tmpmean1bxh = "${newprefix}_tmpmean1.bxh";
+  my $tmpmean1img = "${newprefix}_tmpmean1.nii.gz";
+  my $tmpmean2bxh = "${newprefix}_tmpmean2.bxh";
+  my $tmpmean2img = "${newprefix}_tmpmean2.nii.gz";
+  my $tmpstd1bxh = "${newprefix}_tmpstddev1.bxh";
+  my $tmpstd1img = "${newprefix}_tmpstddev1.nii.gz";
+  my $tmpstd2bxh = "${newprefix}_tmpstddev2.bxh";
+  my $tmpstd2img = "${newprefix}_tmpstddev2.nii.gz";
+  my $tmpmaskbxh = "${newprefix}_tmpmask.bxh";
+  my $tmpmaskimg = "${newprefix}_tmpmask.nii.gz";
+  my $tmpmask1bxh = "${newprefix}_tmpmask1.bxh";
+  my $tmpmask1img = "${newprefix}_tmpmask1.nii.gz";
+  my $tmpmask2bxh = "${newprefix}_tmpmask2.bxh";
+  my $tmpmask2img = "${newprefix}_tmpmask2.nii.gz";
+  my $tmpzero1bxh = "${newprefix}_tmpzero1.bxh";
+  my $tmpzero1img = "${newprefix}_tmpzero1.nii.gz";
+  my $tmpzero2bxh = "${newprefix}_tmpzero2.bxh";
+  my $tmpzero2img = "${newprefix}_tmpzero2.nii.gz";
+  my $tmpn1bxh = "${newprefix}_tmpn1.bxh";
+  my $tmpn1img = "${newprefix}_tmpn1.nii.gz";
+  my $tmpn2bxh = "${newprefix}_tmpn2.bxh";
+  my $tmpn2img = "${newprefix}_tmpn2.nii.gz";
+  my @tmpfiles =
+    (
+     $tmpmean1bxh, $tmpmean1img,
+     $tmpmean2bxh, $tmpmean2img,
+     $tmpstd1bxh, $tmpstd1img,
+     $tmpstd2bxh, $tmpstd2img,
+     $tmpmask1bxh, $tmpmask1img,
+     $tmpmask2bxh, $tmpmask2img,
+     $tmpmaskbxh, $tmpmaskimg,
+     $tmpzero1bxh, $tmpzero1img,
+     $tmpzero2bxh, $tmpzero2img,
+     $tmpn1bxh, $tmpn1img,
+     $tmpn2bxh, $tmpn2img,
+    );
+  unlink @tmpfiles;
+
+  my $base = $groupcomparetmaps{$groupcomparetmap}->[0];
+  my @group1prefixes = @{$groupcomparetmaps{$groupcomparetmap}->[1]};
+  my @group2prefixes = @{$groupcomparetmaps{$groupcomparetmap}->[2]};
+  my @tmaps1 = map { "${_}_${base}.bxh" } @group1prefixes;
+  my @tmaps2 = map { "${_}_${base}.bxh" } @group2prefixes;
+  my @masks1 = map { "${_}_brainmask.bxh" } @group1prefixes;
+  my @masks2 = map { "${_}_brainmask.bxh" } @group2prefixes;
+
+  # create mask
+  run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', @masks1, $tmpmask1bxh);
+  run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', @masks2, $tmpmask2bxh);
+  run_cmd([\*STDOUT], $progbinop, '--add', $tmpmask1bxh, $tmpmask2bxh, $tmpmaskbxh);
+
+  # create means and stddevs
+  run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', '--stddev', $tmpstd1bxh, @tmaps1, $tmpmean1bxh);
+  run_cmd([\*STDOUT], $progmean, '--dimension', 'dataset', '--stddev', $tmpstd2bxh, @tmaps2, $tmpmean2bxh);
+
+  # create N's
+  run_cmd([\*STDOUT], $progbinop, '--mul', '--scalar', '0', $tmpmean1bxh, $tmpzero1bxh);
+  run_cmd([\*STDOUT], $progbinop, '--add', '--scalar', scalar(@masks1), $tmpzero1bxh, $tmpn1bxh);
+  run_cmd([\*STDOUT], $progbinop, '--mul', '--scalar', '0', $tmpmean2bxh, $tmpzero2bxh);
+  run_cmd([\*STDOUT], $progbinop, '--add', '--scalar', scalar(@masks2), $tmpzero2bxh, $tmpn2bxh);
+
+  # do the t-test
+  run_cmd([\*STDOUT], $progttest, '--mask', $tmpmaskbxh, $tmpmean1bxh, $tmpstd1bxh, $tmpn1bxh, $tmpmean2bxh, $tmpstd2bxh, $tmpn2bxh, "${groupcomparetmap}.bxh");
+
+  unlink @tmpfiles;
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.23  2007/10/04 19:55:19  gadde
+# Explicitly require brainmask and exit with error if it doesn't exist.
+#
+# Revision 1.22  2007/08/03 13:55:25  gadde
+# Be more clear in error message.
+#
+# Revision 1.21  2007/08/03 13:42:58  gadde
+# Do the right thing if eval returns undefined.
+#
+# Revision 1.20  2007/08/03 13:38:51  gadde
+# Print out error from trapped die statement in run_cmd if it failed.
+#
+# Revision 1.19  2007/08/03 13:37:30  gadde
+# Trap die statements from run_cmd.
+#
+# Revision 1.18  2007/08/03 13:22:27  gadde
+# Have forked commands return exit status of command.
+#
+# Revision 1.17  2007/08/01 16:33:56  gadde
+# Die if query labels have underscores.
+#
+# Revision 1.16  2007/07/23 15:50:21  gadde
+# Don't break if there are blank lines in prefix file.
+#
+# Revision 1.15  2007/07/13 14:52:20  gadde
+# Warn if group specified in groupcompare does not exist.
+#
+# Revision 1.14  2007/07/12 17:50:15  gadde
+# Fix bug that lets forks get out of hand.
+#
+# Revision 1.13  2007/05/31 19:10:32  gadde
+# Fix append to groupsources array for bare-bones prefix files.
+#
+# Revision 1.12  2007/05/15 14:48:30  gadde
+# Exit if bad maxprocs specified.
+#
+# Revision 1.11  2007/05/14 19:43:52  gadde
+# Remove diagnostics from process wait function.
+#
+# Revision 1.10  2007/05/14 19:41:56  gadde
+# Fix bug introduced in last commit.
+#
+# Revision 1.9  2007/05/14 19:41:08  gadde
+# Fix bug introduced in last commit.
+#
+# Revision 1.8  2007/05/14 19:38:33  gadde
+# Fix repeated appearances of summary '_n', '_avg', and '_std' images
+# in aggregate sums and averages.
+# Also, allow summary point lists usage in regular expressions by
+# protecting them with \Q and \E (they contain the plus ('+') character).
+#
+# Revision 1.7  2007/05/11 15:50:07  gadde
+# Add simple parallelization if --maxprocs is specified.
+#
+# Revision 1.6  2007/05/08 21:16:07  gadde
+# Make this work with command-line prefixes too
+#
+# Revision 1.5  2007/04/18 16:11:42  gadde
+# Allow inputs to come from a file (which can indicate axes and
+# group membership).
+#
+# Revision 1.4  2007/03/20 23:11:18  gadde
+# Do the right thing for "summaries".
+#
+# Revision 1.3  2007/03/20 17:39:31  gadde
+# Add weighted-Z method.
+#
+# Revision 1.2  2007/03/09 17:35:54  gadde
+# Add --nonstandardized.
+#
+# Revision 1.1  2007/02/26 17:14:15  gadde
+# Add bxh_eventstats_combine
+#

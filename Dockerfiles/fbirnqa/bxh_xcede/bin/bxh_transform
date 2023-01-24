@@ -1,0 +1,131 @@
+#!/usr/bin/env perl
+
+# $Id: bxh_transform,v 1.2 2007-12-20 20:54:16 gadde Exp $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::RealDir";
+
+use File::Spec;
+
+use BXHPerlUtils;
+
+my $usage = <<EOM;
+Usage: $0 INPUT MATRIX OUTPUT REFVOL [ORIGREFVOL [NEWMATRIX]]
+
+This tool takes an input image and transforms according to a specified
+transformation matrix.
+INPUT and OUTPUT can be BXH files or NIFTI files (in which case the file
+name may be specified without extensions).
+Output will be written to OUTPUT.bxh and OUTPUT.nii.gz.
+MATRIX must be a text file containing a 4x4 transformation matrix as written
+by the FSL tool FLIRT.
+REFVOL specifies a (NIFTI) reference volume that matches the desired
+resolution, field of view, and orientation labels of the output data.
+If the reference volume does not match the field of view of the original
+reference volume used in generating the transformation matrix, then you must
+specify the original reference volume as ORIGREFVOL (without extensions);
+the orientation labels in ORIGREFVOL override those of REFVOL.
+If NEWMATRIX is specified, the resulting matrix corresponding to the
+new reference volume is written to NEWMATRIX.
+EOM
+
+if (scalar(@ARGV) != 4 && scalar(@ARGV) != 5 && scalar(@ARGV) != 6) {
+  die $usage;
+}
+
+my $inputbase = shift;
+my $matrixfile = shift;
+my $outputbase = shift;
+my $refvol = shift;
+my $origrefvol = undef;
+$origrefvol = shift if scalar(@ARGV);
+my $newmatrixbase = undef;
+$newmatrixbase = shift if scalar(@ARGV);
+
+if (defined($newmatrixbase) && $newmatrixbase =~ /\.mat$/) {
+  $newmatrixbase =~ s/\.mat$//;
+}
+
+$ENV{'FSLOUTPUTTYPE'} = "NIFTI_GZ";
+
+my $proganalyze2bxh = findexecutable("analyze2bxh");
+my $progbxh2analyze = findexecutable("bxh2analyze");
+my $progavwhd = findexecutable("avwhd");
+my $progavworient = findexecutable("avworient");
+my $progavwswapdim = findexecutable("avwswapdim");
+my $progavwcreatehd = findexecutable("avwcreatehd");
+$progavwhd = findexecutable("fslhd") if (!defined($progavwhd));
+$progavworient = findexecutable("fslorient") if (!defined($progavworient));
+$progavwswapdim = findexecutable("fslswapdim") if (!defined($progavwswapdim));
+$progavwcreatehd = findexecutable("fslcreatehd") if (!defined($progavwcreatehd))
+;
+my $progflirt = findexecutable("flirt");
+if (!defined($proganalyze2bxh)) {
+  print STDERR "Can't find program analyze2bxh!\n";
+  exit -1;
+}
+if (!defined($progbxh2analyze)) {
+  print STDERR "Can't find program bxh2analyze!\n";
+  exit -1;
+}
+if (!defined($progavwhd)) {
+  print STDERR "Can't find program avwhd!\n";
+  exit -1;
+}
+if (!defined($progavwcreatehd)) {
+  print STDERR "Can't find program avwcreatehd!\n";
+  exit -1;
+}
+if (!defined($progavworient)) {
+  print STDERR "Can't find program avworient!\n";
+  exit -1;
+}
+if (!defined($progavwswapdim)) {
+  print STDERR "Can't find program avwswapdim!\n";
+  exit -1;
+}
+if (!defined($progflirt)) {
+  print STDERR "Can't find program flirt!\n";
+  exit -1;
+}
+
+my ($inputbasevol, $inputbasedirs, $inputbasefile) =
+  File::Spec->splitpath($inputbase);
+my ($outputbasevol, $outputbasedirs, $outputbasefile) =
+  File::Spec->splitpath($outputbase);
+
+my $tmpinputbase = undef;
+my $tmpinputniigz = undef;
+if ($inputbasefile =~ /.bxh$/) {
+  $inputbasefile =~ s/.bxh$//;
+  $tmpinputbase = File::Spec->catpath($inputbasevol, $inputbasedirs, "tmp${$}_$inputbasefile");
+  $tmpinputniigz = "${tmpinputbase}.nii.gz";
+
+  unlink $tmpinputniigz;
+
+  my @cmd = ();
+  push @cmd, $progbxh2analyze;
+  push @cmd, '--niigz', '-b', '-s', '-v';
+  push @cmd, $inputbase;
+  push @cmd, $tmpinputbase;
+  run_cmd([\*STDOUT], @cmd);
+
+  if (! -f $tmpinputniigz) {
+    die "Error: Error writing '$tmpinputniigz'\n";
+  }
+
+  $inputbase = $tmpinputbase;
+}
+
+my $retmat = flirt_apply_transform([\*STDERR], $inputbase, $outputbase, $origrefvol, $refvol, $matrixfile, $newmatrixbase, undef, undef, $progflirt, $progavwhd, $progavwcreatehd, $progavwswapdim, $progavworient, $proganalyze2bxh);
+
+if (defined($tmpinputniigz)) {
+  unlink $tmpinputniigz;
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.1  2007/12/20 20:53:58  gadde
+# Inital import.
+#
