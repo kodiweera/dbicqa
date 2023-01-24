@@ -1,10 +1,14 @@
+# commandline
+# bash main.sh *date* *dicom_qadata_folder_name*
 
-# variables: $1- date, $2 - directory (i.e, boldp2)
+# variables: $1- date, $2 - directory (i.e, qadata which contains dicom files)
 
-singularity run --cleanenv --bind /dartfs/rc/lab/D/DBIC/DBIC/QA:/dartfs/rc/lab/D/DBIC/DBIC/QA /dartfs/rc/lab/D/DBIC/DBIC/QA/containers/fbirnqa-1.11.14.sif /dartfs/rc/lab/D/DBIC/DBIC/QA/dbic-qa/32CH/$1/$2 /dartfs/rc/lab/D/DBIC/DBIC/QA/dbic-qa/32CH/$1/$2/result
+# results is the output directory inside the qadata forlder
+
+singularity run --cleanenv --bind data/ containers/fbirnqa-1.11.14.sif data/$1/$2 /data/$1/$2/results
 
 
-python /dartfs/rc/lab/D/DBIC/DBIC/QA/fbirnpdf/qapdf.py /dartfs/rc/lab/D/DBIC/DBIC/QA/dbic-qa/32CH/$1/$2/result/ $1
+python fbirnpdf/qapdf.py data/$1/$2/results/ $1
 
 # --creating longitudinal plots for boldp2
 
@@ -13,9 +17,9 @@ var="boldp2"
 if [[ "$2" == "$var" ]]
 
 then
-	python /dartfs/rc/lab/D/DBIC/DBIC/QA/qaplots/createxls.py
+	python qaplots/createxls.py
 
-	python /dartfs/rc/lab/D/DBIC/DBIC/QA/qaplots/qaplots.py /dartfs/rc/lab/D/DBIC/DBIC/QA/qaplots/ $1
+	python qaplots/qaplots.py qaplots/ $1
 else
 	echo "Skip plots for now!"
 
