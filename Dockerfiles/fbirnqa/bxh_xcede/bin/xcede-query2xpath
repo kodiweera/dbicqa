@@ -1,0 +1,35 @@
+#!/usr/bin/env perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use EventUtils;
+
+my $usage = <<EOM;
+Usage: xcede-query2xpath
+
+Provide an XCEDE event query on standard input.  An equivalent
+XPath query is written to standard output.
+EOM
+
+my @savedARGV = @ARGV;
+@ARGV = ();
+while (@savedARGV) {
+  my $arg = shift @savedARGV;
+  if ($arg =~ /^--help$/) {
+    print STDERR $usage;
+    exit -1;
+  } elsif ($arg =~ /^--/) {
+    print STDERR "Unrecognized option $arg";
+    exit -1;
+  }
+  push @ARGV, $arg;
+}
+
+while (@ARGV) {
+  my $queryin = shift;
+  my $queryout = EventUtils::xcede_query_to_xpath($queryin);
+  print STDOUT "$queryout\n";
+}

@@ -1,0 +1,464 @@
+#!/usr/bin/perl -w
+
+# $Id: extractdiffdirs.pl,v 1.4 2009-04-22 16:04:45 gadde Exp $
+
+# Extract diffusion directions from a BXH/XCEDE file wrapping a DTI scan
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use BXHPerlUtils;
+
+my $usage = <<EOM;
+Usage:  extractdtidirs.pl [options] INPUT.bxh OUTVECFILE [OUTBVALFILE]
+
+This tool extracts gradient direction vectors from a BXH/XCEDE file and
+writes them out in formats usable by various DTI processing tools.  You must
+provide options to specify the output format and coordinate space for the
+output directions.  Alternatively, you can specify one of the "shortcuts" which
+will set all the options required for a particular tool.
+If OUTVECFILE and/or OUTBVALFILE are '-', the results are written to standard
+output.
+
+General options:
+  --help
+        print this message.
+  --overwrite
+        overwrite any existing files.
+
+Shortcuts:
+  --fsl
+        For FSL tools (dtifit).  Equivalent to:
+          --colvectors --writebvals --fieldsep='\\t' --space=image --fslorientflip
+  --dtk
+        For Diffusion Toolkit (DTK).  Equivalent to:
+          --rowvectors --writecombined --space=LAI
+
+  --dsistudio
+        For DSI-Studio.  Equivalent to:
+          --rowvectors --writecombined2 --space=RAI
+
+  --medinria
+        For MedINRIA.  Equivalent to:
+          --rowvectors --space=LPS
+
+Output modifiers:
+  --space <str>
+  --space=<str>
+        This option specifies the coordinate space for the output
+        vectors.  If it starts with 'image', then the vectors will be
+        output in "image space".  'image' can be optionally appended
+        with any number of operations (separated by dashes (-)) which
+        will be applied in order on the image space vectors.  Valid
+        operations are 'negX', 'negY', 'negZ', 'flipXY', 'flipXZ',
+        'flipYZ'.  So 'image-negX-flipXY' will produce vectors in
+        image space with the X coordinate negated and then the X and Y
+        coordinates flipped.  If it does not start with 'image', then
+        it should be a three letter code specifying the coordinate
+        system (i.e.  RAS, LPI, etc.).
+  --rowvectors
+        If specified, OUTVECFILE will be arranged as one line per vector,
+        each of which will be a list of values separated by the field
+        separator (see --fieldsep).  This is the default.
+  --colvectors
+        If specified, OUTVECFILE will be arranged in columns, with the first
+        line containing the first component of all vectors (separated by the
+        field separator), and similarly for the second and third lines.
+  --skipbzero
+        If specified, any vectors and values corresponding to b0 volumes
+        (i.e. direction = 0 0 0 or bvalue = 0) are skipped, but only if
+        they occur at the beginning of the list.
+  --writebvals
+        If specified, the OUTBVALFILE argument is required, and b-values for
+        each volume are written to this file in one line, separated by the
+        field separator.
+  --writecombined
+        If specified, the vector *and* b-values for each image will be written
+        to OUTVECFILE, each on one line, with the b-value being the last
+        column.  Incompatible with --colvectors.
+  --writecombined2
+        If specified, the vector *and* b-values for each image will be written
+        to OUTVECFILE, each on one line, with the b-value being the first
+        column.  Incompatible with --colvectors.
+  --writeonebval
+        If specified, the OUTBVALFILE argument is required, and the single
+        non-zero b-value is written to this file.  It is an error if more
+        than one unique non-zero b-value exists in the dataset.
+  --fieldsep <str>
+  --fieldsep=<str>
+        This option sets the field separator, which is a single space (' ') by
+        default.  The backslash character '\\' is an escape character to allow
+        '\\t' to indicate a tab.  To specify a single backslash, use '\\\\'.
+        For any character X where X is not 't' or a backslash '\\', the sequence
+        '\\X' is equivalent to 'X'.
+  --fslorientflip
+        If specified, and only if the coordinate frame the input image (as
+        specified by the orientation vectors) is not LAS-space or a rigid
+        rotation thereof, then several FSL tools (dtifit, for one) will flip
+        the first image axis before processing.  So, this tool will flip the
+        appropriate component of the gradient vector to compensate.  This
+        option only makes sense if --space=image is specified.
+EOM
+
+my $opt_overwrite = 0;
+my $opt_rowvectors = 0;
+my $opt_colvectors = 0;
+my $opt_writebvals = 0;
+my $opt_writeonebval = 0;
+my $opt_writecombined = 0;
+my $opt_writecombined2 = 0;
+my $opt_skipbzero = 0;
+my $opt_fieldsep = ' ';
+my $opt_space = undef;
+my $opt_fslorientflip = 0;
+
+my @savedARGV = @ARGV;
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+my @optdata = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    push @optdata, ["--"];
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)(.*))?$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  my $usedoptarg = 0;
+  if ($opt eq 'help') {
+    print STDERR $usage;
+    exit(-1);
+  } elsif ($opt eq 'overwrite' && !defined($opteq)) {
+    $opt_overwrite++;
+  } elsif ($opt eq 'fsl' && !defined($opteq)) {
+    unshift @oldARGV, '--colvectors', '--writebvals', "--fieldsep=\t", '--space=image', '--fslorientflip';
+  } elsif ($opt eq 'dtk' && !defined($opteq)) {
+    unshift @oldARGV, '--rowvectors', '--writecombined', '--space=LAI';
+  } elsif ($opt eq 'dsistudio' && !defined($opteq)) {
+    unshift @oldARGV, '--rowvectors', '--writecombined2', '--space=RAI';
+  } elsif ($opt eq 'medinria' && !defined($opteq)) {
+    unshift @oldARGV, '--rowvectors', '--space=LPS';
+  } elsif ($opt eq 'rowvectors' && !defined($opteq)) {
+    $opt_rowvectors++;
+  } elsif ($opt eq 'colvectors' && !defined($opteq)) {
+    $opt_colvectors++;
+  } elsif ($opt eq 'skipbzero' && !defined($opteq)) {
+    $opt_skipbzero++;
+  } elsif ($opt eq 'fslorientflip' && !defined($opteq)) {
+    $opt_fslorientflip++;
+  } elsif ($opt eq 'writebvals' && !defined($opteq)) {
+    $opt_writebvals = 1;
+    $opt_writeonebval = 0;
+    $opt_writecombined = 0;
+    $opt_writecombined2 = 0;
+  } elsif ($opt eq 'writeonebval' && !defined($opteq)) {
+    $opt_writeonebval = 1;
+    $opt_writebvals = 0;
+    $opt_writecombined = 0;
+    $opt_writecombined2 = 0;
+  } elsif ($opt eq 'writecombined' && !defined($opteq)) {
+    $opt_writecombined = 1;
+    $opt_writecombined2 = 0;
+    $opt_writeonebval = 0;
+    $opt_writebvals = 0;
+  } elsif ($opt eq 'writecombined2' && !defined($opteq)) {
+    $opt_writecombined = 0;
+    $opt_writecombined2 = 1;
+    $opt_writeonebval = 0;
+    $opt_writebvals = 0;
+  } elsif ($opt eq 'fieldsep' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_fieldsep = $optarg;
+  } elsif ($opt eq 'space' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_space = $optarg;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+}
+
+if (($opt_writecombined || $opt_writecombined2) && $opt_colvectors) {
+  die "Error: incompatible options --writecombined and --colvectors!\n";
+}
+
+if ($opt_fslorientflip && $opt_space ne 'image') {
+  die "Error: incompatible options; if --fslorientflip is specified, then --space=image must be set.\n";
+}
+
+if ($opt_writebvals || $opt_writeonebval) {
+  if (scalar(@ARGV) != 3) {
+    die "Error: wrong number of arguments!\n" . $usage;
+  }
+} else {
+  if (scalar(@ARGV) != 2) {
+    die "Error: wrong number of arguments!\n" . $usage;
+  }
+}
+
+$opt_fieldsep =~ s/\\t/\t/g;
+$opt_fieldsep =~ s/\\(.)/$1/g;
+
+if (!$opt_rowvectors && !$opt_colvectors) {
+  die "Error: one of --rowvectors or --colvectors must be specified\n";
+}
+if (!defined($opt_space)) {
+  die "Error: --space must be specified\n";
+}
+
+my $inputfile = shift;
+my $outputvecfile = shift;
+my $outputbvalfile = undef;
+if ($opt_writebvals || $opt_writeonebval) {
+  $outputbvalfile = shift;
+}
+
+if (!$opt_overwrite && $outputvecfile ne '-' && -e $outputvecfile) {
+  die "Error: '${outputvecfile}' exists!\n";
+}
+if ($opt_writebvals || $opt_writeonebval) {
+  if (!$opt_overwrite && $outputbvalfile ne '-' && -e $outputbvalfile) {
+    die "Error: '${outputbvalfile}' exists!\n";
+  }
+}
+
+my $meta = readxmlmetadata($inputfile);
+
+my @dtidims = grep { $_->{'type'} eq 'diffusiondirection' } values %{$meta->{'dims'}};
+
+if (scalar(@dtidims) > 1) {
+  die "Error: Found more than one diffusion direction dimension?!\n"
+}
+if (scalar(@dtidims) == 0) {
+  die "Error: Could not find a diffusion direction dimension!\n"
+}
+
+my @xdir = @{$meta->{'dims'}->{'x'}->{'direction'}};
+my @ydir = @{$meta->{'dims'}->{'y'}->{'direction'}};
+my @zdir = @{$meta->{'dims'}->{'z'}->{'direction'}};
+my @orientation =
+  (
+   $xdir[0], $ydir[0], $zdir[0], 0,
+   $xdir[1], $ydir[1], $zdir[1], 0,
+   $xdir[2], $ydir[2], $zdir[2], 0,
+   0, 0, 0, 1
+  );
+
+my $dtidim = $dtidims[0];
+
+my $dpsref = undef;
+for my $label ('diffusiondirection', '') {
+  if (exists($dtidim->{'datapoints'}->{$label})) {
+    $dpsref = $dtidim->{'datapoints'}->{$label};
+    last;
+  }
+}
+if (!defined($dpsref)) {
+  die "Error: Can't find diffusion direction vectors!\n";
+}
+my @dtidirs = map { [ split(/\s+/, $_) ] } @{$dpsref};
+
+my @mframe = @{$dtidim->{'measurementframe'}};
+my $mframeversion = 0;
+if (exists $dtidim->{'measurementframeversion'}) {
+  $mframeversion = $dtidim->{'measurementframeversion'};
+}
+if ($mframeversion < 2) {
+  warn "***WARNING*** Measurement frame version is less than 2 -- depending on the equipment/software that generated the data in '$inputfile', it may be incompatible with this software.  To sidestep subtle bugs that may arise, regenerate '$inputfile' with updated software (most recent version of dicom2bxh for example).";
+}
+
+my @space2ras = ();
+if ($opt_space =~ /^image/) {
+  @space2ras = @orientation;
+  if ($opt_fslorientflip) {
+    # our orientation matrix uses RAS coordinate space, so if the image is
+    # in RAS orientation (or any other rigid rotation of it, all of which
+    # FSL will flip), determinant will be positive
+    if (mat44_det(\@orientation) > 0) {
+      $space2ras[0] *= -1;
+      $space2ras[4] *= -1;
+      $space2ras[8] *= -1;
+    }
+  }
+} elsif (lc($opt_space) =~ /^([rlapsi])([rlapsi])([rlapsi])$/) {
+  my ($xvecref, $yvecref, $zvecref) = map {
+    if ($_ eq 'r') {
+      [ 1, 0, 0 ]
+    } elsif ($_ eq 'l') {
+      [ -1, 0, 0 ]
+    } elsif ($_ eq 'a') {
+      [ 0, 1, 0 ]
+    } elsif ($_ eq 'p') {
+      [ 0, -1, 0 ]
+    } elsif ($_ eq 's') {
+      [ 0, 0, 1 ]
+    } elsif ($_ eq 'i') {
+      [ 0, 0, -1 ]
+    }
+  } ($1, $2, $3);
+  @space2ras =
+    (
+     $xvecref->[0], $yvecref->[0], $zvecref->[0], 0,
+     $xvecref->[1], $yvecref->[1], $zvecref->[1], 0,
+     $xvecref->[2], $yvecref->[2], $zvecref->[2], 0,
+     0, 0, 0, 1,
+    );
+} else {
+  die "ERROR: coordinate space '$opt_space' must be 'image' or a three letter orientation code!\n";
+}
+my @ras2space = affmat44_inv(\@space2ras);
+
+my @ident44 =
+  (
+   1, 0, 0, 0,
+   0, 1, 0, 0,
+   0, 0, 1, 0,
+   0, 0, 0, 1
+  );
+
+if ($opt_space =~ /^image/) {
+  my $space = substr($opt_space, 5);
+  while (length($space) > 0) {
+    my @tempmat = @ident44;
+    if ($space =~ /^(-neg(X|Y|Z))/) {
+      if ($2 eq 'X') { $tempmat[0] = -1; }
+      if ($2 eq 'Y') { $tempmat[5] = -1; }
+      if ($2 eq 'Z') { $tempmat[10] = -1; }
+    } elsif ($space =~ /^(-flip(X|Y|Z)(X|Y|Z))/) {
+      if ($2 eq $3) {
+	die "Error: Bad --space parameter '$opt_space' (-flip$2$3 not valid)";
+      }
+      my $start1 = undef;
+      my $start2 = undef;
+      if ($2 eq 'X') { $start1 = 0; }
+      if ($2 eq 'Y') { $start1 = 4; }
+      if ($2 eq 'Z') { $start1 = 8; }
+      if ($3 eq 'X') { $start2 = 0; }
+      if ($3 eq 'Y') { $start2 = 4; }
+      if ($3 eq 'Z') { $start2 = 8; }
+      my @swap = @tempmat[$start1..($start1+3)];
+      @tempmat[$start1..($start1+3)] = @tempmat[$start2..($start2+3)];
+      @tempmat[$start2..($start2+3)] = @swap;
+    } else {
+      die "Error: Bad --space parameter '$opt_space'";
+    }
+    $space = substr($space, length($1));
+    @ras2space = mat44_mult(\@tempmat, \@ras2space);
+  }
+}
+
+# gradient vector space to RAS
+my @mframe44 =
+  (
+   $mframe[0]->[0], $mframe[1]->[0], $mframe[2]->[0], 0,
+   $mframe[0]->[1], $mframe[1]->[1], $mframe[2]->[1], 0,
+   $mframe[0]->[2], $mframe[1]->[2], $mframe[2]->[2], 0,
+   0, 0, 0, 1,
+  );
+
+my @gradxform = mat44_mult(\@ras2space, \@mframe44);
+
+my @bvalues = @{$meta->{'bvalues'}};
+for (my $dimind = 0; $dimind < scalar(@bvalues); $dimind++) {
+  my @dtidir = @{$dtidirs[$dimind]};
+  my $mag = 0;
+  map { $mag += $_ } map { $_ * $_ } @dtidir;
+  if ($mag == 0) {
+    $bvalues[$dimind] = 0;
+  }
+}
+
+if ($opt_skipbzero) {
+  while ($dtidirs[0]->[0] == 0 && $dtidirs[0]->[1] == 0 && $dtidirs[0]->[2] == 0) {
+    shift @dtidirs;
+  }
+}
+
+my @newdtidirs =
+  map {
+    [
+     ($gradxform[0]*$_->[0])+($gradxform[1]*$_->[1])+($gradxform[2]*$_->[2]),
+     ($gradxform[4]*$_->[0])+($gradxform[5]*$_->[1])+($gradxform[6]*$_->[2]),
+     ($gradxform[8]*$_->[0])+($gradxform[9]*$_->[1])+($gradxform[10]*$_->[2]),
+    ]
+  } @dtidirs;
+
+my $fh = undef;
+if ($outputvecfile eq '-') {
+  $fh = \*STDOUT;
+} else {
+  open($fh, '>', $outputvecfile) || die "Error opening '$outputvecfile'\n";
+}
+if ($opt_rowvectors) {
+  if ($opt_writecombined) {
+    map { print $fh join($opt_fieldsep, @{$newdtidirs[$_]}, $bvalues[$_]), "\n" } (0..$#newdtidirs);
+  } elsif ($opt_writecombined2) {
+    map { print $fh join($opt_fieldsep, $bvalues[$_], @{$newdtidirs[$_]}), "\n" } (0..$#newdtidirs);
+  } else {
+    map { print $fh join($opt_fieldsep, @$_), "\n" } @newdtidirs;
+  }
+} elsif ($opt_colvectors) {
+  map { my $index = $_; print $fh join($opt_fieldsep, map { $_->[$index] } @newdtidirs), "\n"; } (0,1,2);
+}
+if ($outputvecfile ne '-') {
+  close $fh;
+}
+
+if ($opt_writebvals || $opt_writeonebval) {
+  if ($outputbvalfile eq '-') {
+    $fh = \*STDOUT;
+  } else {
+    open($fh, '>', $outputbvalfile) || die "Error opening '$outputbvalfile'\n";
+  }
+  if ($opt_skipbzero) {
+    while ($bvalues[0] == 0) {
+      shift @bvalues;
+    }
+  }
+  if ($opt_writebvals) {
+    print $fh join($opt_fieldsep, @bvalues), "\n";
+  } elsif ($opt_writeonebval) {
+    my $onebval = 0;
+    for my $bval (@bvalues) {
+      next if $bval == 0;
+      if ($onebval == 0) {
+	$onebval = $bval;
+      }
+      if ($bval ne $onebval) {
+	die "--writeonebval specified, but multiple non-zero bvalues found!\n";
+      }
+    }
+    if ($onebval == 0) {
+      die "No non-zero bvalues found in '${inputfile}'!\n";
+    }
+    print $fh $onebval, "\n";
+  }
+  if ($outputbvalfile ne '-') {
+    close $fh;
+  }
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.3  2009/04/08 16:23:25  gadde
+# Code cleanup.
+#
+# Revision 1.2  2009/04/06 17:28:23  gadde
+# Add overwrite option, and rename skipzerovecs option to skipbzero.
+# Add bval output.
+# Add missing file handle close.
+#
+# Revision 1.1  2009/04/03 00:55:04  gadde
+# Add extractdiffdirs.pl
+#

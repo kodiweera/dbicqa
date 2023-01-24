@@ -1,0 +1,1153 @@
+#!/usr/bin/perl -w
+
+# this is a catch-all script for converting various tabular event files
+# to the XML events structure.  Specific functionality is triggered
+# by checking the name of the script.
+
+use strict;
+
+use File::Spec;
+use Sys::Hostname;
+
+# for Windows UTF-16LE from later E-Prime versions
+use Encode;
+use Encode::Guess;
+
+my $usage = <<EOM;
+Use '$0 --help' for help.
+EOM
+
+my $eprimehelp = <<'EOM';
+Usage:
+  eprime2xml instructions.txt eprime.txt [outputevents.xml]
+
+eprime2xml takes an E-Prime output file as exported as text from
+the E-Prime software and an instruction file, and creates an
+XML event file.  The instruction file indicates which columns
+in the E-Prime file are of interest and what they should map
+to in the output event file.  If the output file is not specified,
+the event data is written to standard output.
+EOM
+
+my $presentationhelp = <<'EOM';
+Usage:
+  presentation2xml instructions.txt inputevents.txt [outputevents.xml]
+
+presentation2xml takes a Presentation output file and an instruction
+file, and creates an XML events file.  The instruction file indicates
+which columns in the Presentation file are of interest and what
+they should map to in the output event file.  If the output file is
+not specified, the event data is written to standard output.
+EOM
+
+my $tablehelp = <<'EOM';
+Usage:
+  eventstable2xml instructions.txt inputevents.txt [outputevents.xml]
+
+eventstable2xml takes a text tabular events file and an instruction
+file, and creates an XML events file.  The instruction file indicates
+which columns in the original events file are of interest and what
+they should map to in the output event file.  If the output file is
+not specified, the event data is written to standard output.
+EOM
+
+my $threecolumnhelp = <<'EOM';
+Usage:
+  3column2xml units evfile1 evfile2...
+
+3column2xml takes any number of 3-column timing files (as used in
+FSL) and creates an XML events file.  The name of the timing files
+become the "condition" value in the event XML file.  The first two
+columns become the onset and duration for each event, and the third
+column is put into a "weight" value.  The resulting XML file is written
+to standard output.  The units argument must be 'sec', 'msec', or 'dmsec'.
+EOM
+
+my $commonhelp = <<'EOM';
+Options:
+  --xcede2
+        Write in XCEDE2 format.
+  --xcede2dataid=ID
+        ID for the XCEDE 2 data element (default: auto-generated based
+        on hostname, process ID, and current time)
+  --extracttable
+        Instead of creating XML as output, output as tabular text.
+        This is a no-op for most formats, and is really only useful for
+        converting E-Prime "recovery" logs into a tabular form.
+  --columnnames
+        If this options is specified, only the columns of the table are
+        printed (one per line) and the program exits.
+  --subtractonset SECS
+        This option subtracts SECS from all onset times (default is 0).
+        This is in addition to any other normalization that may occur
+        (see use of 'firstmritime' below).
+  --colsep SEPARATOR
+        This option specifies the column separator (default is tab).
+
+The instruction file language is defined as follows:
+
+ COMMAND VALUESPEC [VALUESPEC...]
+
+where COMMAND can be event, param, or block.  VALUESPEC has one
+of the following formats:
+
+ [OUTVALUENAME=]COLUMNNAME[:UNITS]
+ OUTVALUENAME=@TEXT[:UNITS]
+
+Each VALUESPEC defines values that should be passed through to
+the corresponding event, param, or block.  In the first alternative
+listed above, the value comes from a column in the input file
+(optionally renamed to OUTVALUENAME) and in the second
+alternatives, the value is directly specified preceded by a '@' character.
+If OUTVALUENAME= is missing, then the VALUESPEC is equivalent to:
+
+ COLUMNNAME=COLUMNNAME[:UNITS]
+
+OUTVALUENAME may not contain the equals sign ('='), at sign ('@'), quotes,
+or whitespace.
+
+Either COLUMNNAME or TEXT may contain quoted substrings to protect special
+characters like colon (':'), equals sign ('='), at sign ('@'), or whitespace;
+otherwise these special characters are prohibited.  A single quote will
+protect all characters until the next single quote, and likewise for double
+quote.  The following examples show equivalent VALUESPECs:
+
+ description=DESC
+ description=D'E'"SC"
+
+ onset="Onset Time":secs
+ onset=Onset' 'Time:secs
+ onset=Onse't T'ime:secs
+
+Unquoted spaces separate VALUESPECs.
+
+----------------
+'event' command:
+----------------
+Each 'event' command creates a class of events in the output
+event file, where the contents of the event are specified by
+the VALUESPECs.  In general, for each matching row (more later),
+it creates an event with the following contents:
+
+  <event type="$type" units="$units">
+    <onset>$onset</onset>
+    <duration>$duration</duration>
+    <name>$name</name>
+    <description>$description</description>
+    <value name="OUTVALUENAME1" units="UNITS1">VALUE1</value>
+    <value name="OUTVALUENAME2" units="UNITS2">VALUE2</value>
+    ...
+  </event>
+
+VALUESPECs whose OUTVALUENAMEs start with a dollar sign ( $ ) are
+"magic", and are interpreted in a value-specific way.  VALUESPECs
+whose OUTVALUENAMEs start with a percent sign ( % ) are explicitly
+non-magic.  Any OUTVALUENAME not starting with a % or $ is
+is assumed to have an implicit % unless it matches a list of
+pre-defined magic values (below), in which case an implicit $
+is assumed.
+
+Pre-defined magic values '$type', '$units', '$onset', '$duration',
+'$name', and '$description' are put in the appropriate child element
+or attribute of <event> (shown above).  Only the '$onset' VALUESPEC
+is required.  Default value for '$duration' is zero.  All non-magic
+values are placed in <value> elements.
+
+The pre-defined magic value '$DURUNTIL' indicates that any row in the
+input used to create an event will have an ending time specified by
+the value of column COLUMNNAME in the current row.  Likewise, the
+value '$DURUNTILNEXTROW' does the same thing, but grabs the value from
+the next row.  These are used to calculate the duration of this event.
+This may be specified more than once, and the first non-NULL column
+will be used.  This option is used when a row does not have a duration
+column, and it must be calculated based on times in this or the
+subsequent row.
+
+By default, only those rows whose '$onset' column is non-empty and
+non-NULL will be processed as events.  Certain magic OUTVALUENAMEs
+further restrict the rows that are used for this event command.
+'$MATCH' and '$MATCHNONZERO' specify a column whose values indicate
+whether that row should be selected -- for '$MATCH', the values must
+be non-empty and non-'NULL'; for '$MATCHNONZERO', the values must also
+be non-zero.  With '$MATCHEQUAL', one specifies both a column and an
+actual value to match -- for the '$MATCHEQUAL' value name (and only
+the '$MATCHEQUAL' value name) the VALUESPEC syntax is extended in the
+following way:
+
+ $MATCHEQUAL=COLUMNNAME@MATCHVALUE
+
+where COLUMNNAME and MATCHVALUE are the two relevant parameters.
+
+----------------
+'block' command:
+----------------
+The block command has the same usage as the event command.
+The same magic values apply to block commands as event commands.
+An '$onset' value is again required, and '$duration' is
+optional (assumed to be zero [0] if missing).
+
+----------------
+'param' command:
+----------------
+Each param command specifies a list of columns that should be
+put in the <params> section of the event file.  These represent
+parameters that are constant (or default) throughout the events
+file.  Each VALUESPEC represents one item to put in the <params>
+element as such:
+
+  <params>
+    ...
+    <value name="OUTVALUENAME1" units="UNITS1">VALUE1</value>
+    <value name="OUTVALUENAME2" units="UNITS2">VALUE2</value>
+    ...
+  </params>
+
+Only the first non-empty, non-NULL field in the column specified by a
+'param' will be used.  Be aware of this if this column does not have
+the same value in every row.
+
+There is one magic OUTVALUENAME (maybe more later) '$firstmritime',
+which will generate the following element:
+
+  <params>
+    <firstmritime>0</firstmritime>
+  </params>
+
+If '$firstmritime' is specified, it (and all '$onset' VALUESPECs)
+must have UNITS specified.  All '$onset' columns are normalized
+by this value, so their units and '$firstmritime' units must match.
+EOM
+
+my $help = '';
+if ($0 =~ /eprime2xml$/) {
+  $help .= $eprimehelp . $commonhelp;
+} elsif ($0 =~ /eventstable2xml$/) {
+  $help .= $tablehelp . $commonhelp;
+} elsif ($0 =~ /presentation2xml$/) {
+  $help .= $presentationhelp . $commonhelp;
+} elsif ($0 =~ /3column2xml$/) {
+  $help .= $threecolumnhelp . $commonhelp;
+} else {
+  die "Don't recognize the name of this script ($0)!\n";
+}
+
+my $opt_subtractonset = 0;
+my $opt_colsep = "\t";
+my $opt_extracttable = 0;
+my $opt_columnnames = 0;
+my $opt_3colunits = undef;
+my $opt_xcede2 = 0;
+my $opt_xcede2dataid = undef;
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)?(.*))$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  if ($opt eq 'help') {
+    print STDERR $help;
+    exit(-1);
+  } elsif ($opt eq 'xcede2') {
+    $opt_xcede2++;
+  } elsif ($opt eq 'xcede2dataid' && defined($optarg)) {
+    $opt_xcede2dataid = $optarg;
+    shift @oldARGV;
+  } elsif ($opt eq 'subtractonset' && defined($optarg)) {
+    $opt_subtractonset = $optarg;
+    shift @oldARGV;
+  } elsif ($opt eq 'colsep' && defined($optarg)) {
+    $opt_colsep = $optarg;
+    shift @oldARGV;
+  } elsif ($opt eq 'extracttable') {
+    $opt_extracttable++;
+  } elsif ($opt eq 'columnnames') {
+    $opt_columnnames++;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+}
+
+if (scalar(@ARGV) < 2) {
+  die $usage;
+}
+
+my $instfile = undef;
+my @inputfiles = ();
+if ($0 =~ /3column2xml$/) {
+  $opt_3colunits = shift;
+  die "Unrecognized units '$opt_3colunits'\n"
+    if ($opt_3colunits !~ /secs?|msecs?|dsecs?/);
+  @inputfiles = @ARGV;
+  @ARGV = ();
+} else {
+  $instfile = shift;
+  @inputfiles = (shift);
+}
+my $outfh = undef;
+if (scalar(@ARGV) == 0) {
+  open($outfh, '>&', "STDOUT") ||
+    die "Error opening standard output for writing: $!";
+} else {
+  my $outfile = shift @ARGV;
+  if (-e $outfile) {
+    die "Error: $outfile exists.\n";
+  }
+  open($outfh, '>', $outfile) ||
+    die "Error opening '$outfile' for writing: $!";
+}
+
+my @eventlist = ();
+my @blocklist = ();
+my @paramlist = ();
+my %datahash = ();
+my $numrows = undef;
+my $firstmritime = undef;
+my $firstmritimeunits = undef;
+
+my @magiceventnames = ('type', 'units', 'name', 'description', 'onset', 'duration', 'MATCH', 'MATCHNONZERO', 'MATCHEQUAL', 'DURUNTIL', 'DURUNTILNEXTROW');
+my @magicparamnames = ('firstmritime');
+my @magicblocknames = ();
+
+my @tablelines = ();
+if ($0 =~ /3column2xml$/) {
+  push @tablelines, join($opt_colsep, 'condition', 'onset', 'duration', 'weight');
+  for my $inputfile (@inputfiles) {
+    my ($vol, $dirs, $file) = File::Spec->splitpath($inputfile);
+    open(EFH, '<', $inputfile) || die "Error opening $inputfile: $!\n";
+    while (<EFH>) {
+      s/^\s+//;
+      s/\s+$//;
+      s/(\r|\n)*$//;
+      my ($onset, $duration, $weight) = split(/\s+/, $_);
+      push @tablelines, join($opt_colsep, $file, $onset, $duration, $weight, "\n");
+    }
+    close EFH;
+  }
+} else {
+  my $encoding = undef;
+  open(EFH, '<', $inputfiles[0]) || die "Error opening $inputfiles[0]: $!\n";
+  {
+    local $/;
+    my $data = <EFH>;
+    $encoding = Encode::Guess::guess_encoding($data);
+  }
+  close EFH;
+  open(EFH, '<', $inputfiles[0]) || die "Error opening $inputfiles[0]: $!\n";
+  if (ref($encoding) eq 'Encode::Unicode') {
+    binmode EFH, ":raw:encoding($encoding->{Name}):crlf:utf8";
+  }
+  @tablelines = <EFH>;
+  close EFH;
+  if ($0 =~ /eprime2xml$/ ||
+      $0 =~ /presentation2xml$/) {
+    my $curline = shift @tablelines;
+    if ($0 =~ /eprime2xml$/ && $curline =~ /\*\*\* Header Start \*\*\*/) {
+      # this is a E-Prime text log; convert it to tabular form
+      my @levelnames = (undef, );
+      while (scalar(@tablelines)) {
+	$curline = shift @tablelines;
+	$curline =~ s/\s+$//;
+	($curline =~ /^\s*$/) && next;
+	if ($curline =~ /(.*?):( (.*))?/) {
+	  my $colname = $1;
+	  my $colvalue = $3;
+	  if ($colname eq 'LevelName') {
+	    push @levelnames, $colvalue;
+	  }
+	} elsif ($curline =~ /\*\*\* Header End \*\*\*/) {
+	  last;
+	} else {
+	  die "Don't understand line: $curline\n";
+	}
+      }
+      my @colnamelevels = ();
+      my %colname2index = (); # index of column name in @colnamelevels
+      my %branchedcolnames = (); # has col names that occur in multiple levels
+      my %coldata = ();
+      my @rowlevels = ();
+      my $lastlevel = 0;
+      while (scalar(@tablelines)) {
+	$curline = shift @tablelines;
+	$curline =~ s/\s+$//;
+	($curline =~ /^\s*$/) && next;
+	($curline =~ /Level: (.*)/) || die "Can't find 'Level' line\n";
+	my $level = $1;
+	my $levelname = $levelnames[$level];
+	scalar(@tablelines) || die "Unexpected end of file!\n";
+	$curline = shift @tablelines;
+	($curline =~ /\*\*\* LogFrame Start \*\*\*/) ||
+	  die "Can't find LogFrame Start\n";
+	my %thislevel = ();
+	# add level instance index (one plus number of previous instances of
+	# this level without an intervening frame with lower level number)
+	unshift @tablelines, "${levelname}: " . (scalar(grep { $_ == $level } @rowlevels) + 1);
+	while (scalar(@tablelines)) {
+	  $curline = shift @tablelines;
+	  $curline =~ s/\s+$//;
+	  $curline =~ s/^\s+//;
+	  ($curline =~ /\*\*\* LogFrame End \*\*\*/) && last;
+	  ($curline =~ /(.*?):( (.*))?/) ||
+	    die "Don't understand line: $curline\n";
+	  my $colname = $1;
+	  my $colvalue = $3;
+	  # check to see if this column occurs in other levels.  If so,
+	  # we need to flag this column name (if not done already)
+	  my $expandcolname = 0;
+	  if (exists($branchedcolnames{$colname})) {
+	    $expandcolname = 1;
+	  } elsif (exists($coldata{$colname})) {
+	    my $colindex = $colname2index{$colname};
+	    my ($oldcolname, $oldcollevel, $oldcolrank) =
+	      @{$colnamelevels[$colindex]};
+	    if ($level != $oldcollevel) {
+	      # this column exists in multiple levels, and we haven't
+	      # noticed that before.  Add it to branchedcolnames, and
+	      # fix previously existing column name to expanded one.
+	      my $oldlevelname = $levelnames[$oldcollevel];
+	      my $newcolname = "$oldcolname\[$oldlevelname\]";
+	      $colname2index{$newcolname} = $colname2index{$oldcolname};
+	      delete $colname2index{$oldcolname};
+	      $coldata{$newcolname} = $coldata{$oldcolname};
+	      delete $coldata{$oldcolname};
+	      $colnamelevels[$colindex] =
+		[ $newcolname, $oldcollevel, $oldcolrank ];
+	      $branchedcolnames{$oldcolname} = 1;
+	      $expandcolname = 1;
+	    }
+	  }
+	  # if this column occurs on multiple levels, we need to add [Level]
+	  # to the column name
+	  if ($expandcolname) {
+	    $colname = "$colname\[$levelname\]";
+	  }
+	  $thislevel{$colname} = $colvalue;
+	  if (!exists($coldata{$colname})) {
+	    $coldata{$colname} = [];
+	    push @colnamelevels, [$colname, $level, scalar(@colnamelevels)];
+	    $colname2index{$colname} = $#colnamelevels;
+	  }
+	}
+	if ($level < $lastlevel) {
+	  my @indices = grep { $rowlevels[$_] > $level } (0..$#rowlevels);
+	  map { @{$coldata{$_}}[@indices] = ($thislevel{$_}) x scalar(@indices) } keys %thislevel;
+	  @rowlevels[@indices] = ($level) x scalar(@indices);
+	} elsif ($level >= $lastlevel) {
+	  my $newrownum = scalar(@rowlevels);
+	  push @rowlevels, $level;
+	  map { $coldata{$_}->[$newrownum] = $thislevel{$_} } keys %thislevel;
+	}
+	$lastlevel = $level;
+      }
+      my @colnames = map { $_->[0] } sort { $a->[1] cmp $b->[1] || lc($a->[0]) cmp lc($b->[0]) || $a->[2] cmp $b->[2] } @colnamelevels;
+      @tablelines = ();
+      push @tablelines, join("\t", @colnames) . "\n";
+      # pre-arrange coldata columns in final order
+      my @orderedcoldata = map { $coldata{$_} } @colnames;
+      for my $rownum (0..$#rowlevels) {
+	push @tablelines,
+	  join("\t",
+	       map {
+		 if ($rownum < scalar(@$_) && defined($_->[$rownum])) {
+		   $_->[$rownum]
+		 } else {
+		   ""
+		 }
+	       } @orderedcoldata
+	      ) . "\n";
+      }
+    } else {
+      # Eprime and Presentation tabular text formats have three lines at the
+      # top that are not used by this script
+      $curline = shift @tablelines;
+      $curline = shift @tablelines;
+    }
+  }
+}
+
+if ($opt_extracttable) {
+  print STDOUT join('', @tablelines);
+  exit 0;
+}
+
+# grab column headings
+my $varnamestr = shift @tablelines;
+$varnamestr =~ s/(\r|\n)*$//;
+my @varnames = split(/$opt_colsep/, $varnamestr);
+
+if ($opt_columnnames) {
+  print STDOUT join("\n", @varnames), "\n";
+  exit 0;
+}
+
+my @instfilelines = ();
+if ($0 =~ /3column2xml$/) {
+  push @instfilelines, <<EOM;
+event \$onset=onset:$opt_3colunits \$duration=duration:$opt_3colunits weight=weight condition=condition
+EOM
+} else {
+  open(IFH, '<', $instfile) || die "Error opening $instfile: $!\n";
+  @instfilelines = <IFH>;
+  close IFH;
+}
+while (scalar(@instfilelines)) {
+  $_ = shift @instfilelines;
+  s/(\r|\n)*$//;
+  s/#.*//;
+  next if /^\s*$/;
+  my ($cmd, $args) = /^\s*(\S+)\s+(.*)$/;
+  goto BADINST if (!defined($cmd) || length($args) == 0);
+  my $colrefs = [];
+  while (length($args) > 0) {
+    my ($valuevar,$valuetext);
+    my ($fullarg, $valuename, $textflag, $textorcolumn, $valueunits) =
+      ($args =~ /^
+		 (                # begin capture $1 full arg
+		  (?:             #  begin optional cluster OUTVALUENAME=
+		   ([^=\@'"\s]+?) #   capture $2 value name
+		   =)?            #  end optional cluster OUTVALUENAME=
+		  (\@?)           #  capture $3 text flag
+		  (               #  begin capture text with optionally quoted substrs
+		   (?:            #   repeat
+		    '[^']*'       #    single quoted substring
+		   |              #    or
+		    "[^"]*"       #    double quoted substring
+		   |              #    or
+		    [^:=\@'"\s]+  #    unquoted substring
+		   )+             #   end repeat
+		  )               #  end text $4 textorcolumn
+		  (?:             #  begin optional cluster :UNITS
+		   :              #
+		   (\S+)          #   $5 valueunits
+		  )?              #  end optional cluster :UNITS
+		  (?:\s+|$)       #  make sure it ends with whitespace or EOL
+		 )                # end $1 full arg
+		/x);
+    if (!defined($fullarg) || $fullarg eq '') {
+      ($fullarg, $valuename, $valuevar, $textflag, $valuetext, $valueunits) =
+	($args =~ /^
+		   (                # begin capture $1 full arg
+		    (\$?MATCHEQUAL) #  capture $2 value name
+		    =               #
+		    (               #  begin capture text with optionally quoted substrs
+		     (?:            #   repeat
+		      '[^']*'       #'   single quoted substring
+		     |              #    or
+		      "[^"]*"       #"   double quoted substring
+		     |              #    or
+		      [^:=\@'"\s]+  #'   unquoted substring
+		     )+             #   end repeat
+		    )               #  end text $3 valuevar
+		    (@)             #  capture $4 textflag
+		    (               #  begin capture text with optionally quoted substrs
+		     (?:            #   repeat
+		      '[^']*'       #'   single quoted substring
+		     |              #    or
+		      "[^"]*"       #"   double quoted substring
+		     |              #    or
+		      [^:=\@'"\s]+  #'   unquoted substring
+		     )+             #   end repeat
+		    )               #  end text $5 valuetext
+		    (?:             #  begin optional cluster :UNITS
+		     :              #
+		     (\S+)          #   $6 valueunits
+		    )?              #  end optional cluster :UNITS
+		    (?:\s+|$)       #  make sure it ends with whitespace or EOL
+		   )                # end $1 full arg
+		  /x);
+    }
+    if (!defined($fullarg) || $fullarg eq '') {
+      print STDERR "Bad VALUESPEC starting here: $args\n";
+      goto BADINST;
+    }
+    # @TEXT without preceding VALUENAME is allowed by the regexp
+    # so catch it here
+    if ($textflag eq '@' && !defined($valuename)) {
+      print STDERR "Text VALUESPEC requires VALUENAME before '\@' here: $args\n";
+      goto BADINST;
+    }
+
+    if (!defined($valuename) || $valuename !~ /^\$?MATCHEQUAL$/) {
+      if ($textflag eq '@') {
+	$valuetext = $textorcolumn;
+      } else {
+	$valuevar = $textorcolumn;
+	if (!defined($valuename)) {
+	  $valuename = $valuevar;
+	}
+      }
+    }
+
+    # normalize the quoted substrings (if any).
+    # this is carefully constructed to work correctly in the case
+    # where two different types of quotes may be used in the same string.
+    if (defined($valuevar)) {
+      $valuevar =~
+	s/([^'"]*)  # any-length unquoted substring followed by...
+	  (?:
+	  (['"])    # the quote
+	  (.*?)     # the string not containing that quote
+	  \2        # the quote again
+	 )/$1$3/gx; # write unquoted substring and substring inside quotes
+       }
+    if (defined($valuetext)) {
+      $valuetext =~
+	s/([^'"]*)  # any-length unquoted substring followed by...
+	  (?:
+	  (['"])    # the quote
+	  (.*?)     # the string not containing that quote
+	  \2        # the quote again
+	 )/$1$3/gx; # write unquoted substring and substring inside quotes
+       }
+
+    push @$colrefs, [$valuename, $valuevar, $valuetext, $valueunits];
+    $args = substr($args, length($fullarg));
+  }
+  if ($cmd eq 'event') {
+    push @eventlist, $colrefs;
+  } elsif ($cmd eq 'block') {
+    push @blocklist, @$colrefs;
+  } elsif ($cmd eq 'param') {
+    push @paramlist, @$colrefs;
+  } else {
+    print STDERR "Unrecognized command '$cmd'.\n";
+    goto BADINST;
+  }
+  next;
+ BADINST:
+  die "Bad instruction: $_\n";
+}
+
+my @inputdata = ();
+$numrows = 0;
+while (scalar(@tablelines)) {
+  my $curline = shift @tablelines;
+  $curline =~ s/(\r|\n)*$//;
+  next if ($curline =~ /^\s*$/);
+  $numrows++;
+  my @values = split($opt_colsep, $curline, -1);
+  for my $i (0..$#values) {
+    push @{$inputdata[$i]}, $values[$i];
+  }
+  for my $i ($#values+1..$#varnames) {
+    push @{$inputdata[$i]}, undef;
+  }
+}
+
+for my $i (0..$#varnames) {
+  $datahash{$varnames[$i]} = $inputdata[$i];
+}
+undef @inputdata;
+undef @varnames;
+
+# validate the varnames used in each instruction
+for my $eventref (@eventlist) {
+  for my $valueref (@$eventref) {
+    my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+    if (substr($valuename,0,1) eq '$' &&
+	! grep { substr($valuename,1) eq $_ } @magiceventnames) {
+      die "Reserved value name '$valuename' is not recognized!\n";
+    }
+    if (grep { $valuename eq $_ } @magiceventnames) {
+      $valueref->[0] = '$' . $valueref->[0];
+    } elsif (substr($valuename,0,1) ne '$' && substr($valuename,0,1) ne '%') {
+      $valueref->[0] = '%' . $valueref->[0];
+    }
+    next if !defined($valuevar);
+    die "Bad variable name '$valuevar'\n" if !exists($datahash{$valuevar});
+  }
+  if (! grep { $_->[0] eq '$onset' } @$eventref) {
+    die
+      "Event command must specify '\$onset' column.  Bad command:\n" .
+      " event " . join(" ", map { "$_->[0]=" . (defined($_->[1]) ? $_->[1] : "'$_->[2]'") . (defined($_->[3]) ? ":$_->[3]" : "") } @$eventref) . "\n";
+  }
+}
+for my $valueref (@blocklist) {
+  my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+  next if !defined($valuevar);
+  die "Bad variable name '$valuevar'\n" if !exists($datahash{$valuevar});
+  if (grep { $valuename eq $_ } @magicblocknames) {
+    $valueref->[0] = '$' . $valuename;
+  } elsif (substr($valuename,0,1) ne '$' && substr($valuename,0,1) ne '%') {
+    $valueref->[0] = '%' . $valuename;
+  }
+}
+for my $valueref (@paramlist) {
+  my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+  next if !defined($valuevar);
+  die "Bad variable name '$valuevar'\n" if !exists($datahash{$valuevar});
+  if (grep { $valuename eq $_ } @magicparamnames) {
+    $valueref->[0] = '$' . $valuename;
+  } elsif (substr($valuename,0,1) ne '$' && substr($valuename,0,1) ne '%') {
+    $valueref->[0] = '%' . $valuename;
+  }
+}
+
+# make sure each column chosen for param commands has a valid value
+for my $valueref (@paramlist) {
+  my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+  next if !defined($valuevar);
+  my @valuelist = @{$datahash{$valuevar}};
+  if (! grep { defined($_) && length($_) ne 0 && $_ ne 'NULL' } @valuelist) {
+    die "Column chosen for param ($valuevar) does not have any valid value!\n";
+  }
+}
+
+# create output
+print $outfh <<EOM;
+<?xml version="1.0"?>
+EOM
+if ($opt_xcede2) {
+  if (!defined($opt_xcede2dataid)) {
+    $opt_xcede2dataid = hostname() . "_" . $$ . "_" . time();
+  }
+  print $outfh <<EOM;
+<XCEDE xmlns='http://www.xcede.org/xcede-2'
+       xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+       version="2.0">
+  <data ID='$opt_xcede2dataid' xsi:type="events_t">
+EOM
+} else {
+  print $outfh <<EOM;
+<events>
+EOM
+}
+if (scalar(@paramlist) > 0) {
+  print $outfh "  <params>\n";
+  for my $valueref (@paramlist) {
+    my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+    if ($valuename ne '$MATCHEQUAL' && defined($valuetext)) {
+      $valuetext =~ s/&/&amp;/g;
+      $valuetext =~ s/'/&apos;/g; #'
+      $valuetext =~ s/"/&quot;/g; #"
+      $valuetext =~ s/</&lt;/g;
+      $valuetext =~ s/>/&gt;/g;
+    }
+    my $unitsstr = '';
+    if (defined($valueunits)) {
+      $unitsstr = " units='$valueunits'";
+    }
+    my $val;
+    if (defined($valuevar)) {
+      my @validvals = grep { defined($_) && length($_) ne 0 && $_ ne 'NULL' } @{$datahash{$valuevar}};
+      $val = $validvals[0];
+    } else {
+      $val = $valuetext;
+    }
+    if ($valuename eq '$firstmritime') {
+      $firstmritime = $val;
+      $firstmritimeunits = $valueunits;
+      if (!defined($firstmritimeunits)) {
+	die "If 'firstmritime' is specified, you must specify units for it and all onsets,\nand all units must match.  Didn't find units for firstmritime!\n";
+      }
+      print $outfh "    <firstmritime$unitsstr>0</firstmritime>\n";
+    } else {
+      $valuename = substr($valuename,1); # get rid of '%'
+      print $outfh "    <value name='$valuename'$unitsstr>$val</value>\n";
+    }
+  }
+  print $outfh "  </params>\n";
+}
+
+for my $eventnum (0..$#eventlist) {
+  my $eventref = $eventlist[$eventnum];
+  my $onsetvar = undef;
+  my $onsettext = undef;
+  my $onsetunits = undef;
+  my $onsetcolref = undef;
+  my $durationvar = undef;
+  my $durationtext = undef;
+  my $durationunits = undef;
+  my $durationcolref = undef;
+  my $typecolref = undef;
+  my $unitscolref = undef;
+  my $namecolref = undef;
+  my $descriptioncolref = undef;
+  my $matchcolref = undef;
+  my $matchnonzerocolref = undef;
+  my $matchequalcolref = undef;
+  my $matchequalvalue = undef;
+  my @duruntilcolrefs = ();
+  my $revindicesref = [];
+  my $unitshashref = {};
+  my $colhashref = {};
+  for my $valueref (@$eventref) {
+    my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+    my $newcolref = undef;
+    if (defined($valuevar)) {
+      $newcolref = [@{$datahash{$valuevar}}];
+    } else {
+      $newcolref = [($valuetext) x $numrows];
+    }
+    @$newcolref = map {
+      if (defined($_)) {
+	s/&/&amp;/g;
+	s/'/&apos;/g; #'
+	s/"/&quot;/g; #"
+	s/</&lt;/g;
+	s/>/&gt;/g;
+      }
+      $_
+    } @$newcolref;
+    $colhashref->{$valuename} = $newcolref;
+    $unitshashref->{$valuename} = $valueunits;
+    if ($valuename eq '$onset') {
+      $onsetvar = $valuevar;
+      $onsettext = $valuetext;
+      $onsetunits = $valueunits;
+      $onsetcolref = $newcolref;
+    } elsif ($valuename eq '$duration') {
+      $durationvar = $valuevar;
+      $durationtext = $valuetext;
+      $durationunits = $valueunits;
+      $durationcolref = $newcolref;
+    } elsif ($valuename eq '$type') {
+      $typecolref = $newcolref;
+    } elsif ($valuename eq '$units') {
+      $unitscolref = $newcolref;
+    } elsif ($valuename eq '$name') {
+      $namecolref = $newcolref;
+    } elsif ($valuename eq '$description') {
+      $descriptioncolref = $newcolref;
+    } elsif ($valuename eq '$MATCH') {
+      if (!defined($valuevar)) {
+	die "The '\$MATCH' value spec must specify a column!\n";
+      }
+      $matchcolref = $newcolref;
+    } elsif ($valuename eq '$MATCHNONZERO') {
+      if (!defined($valuevar)) {
+	die "The '\$MATCHNONZERO' value spec must specify a column!\n";
+      }
+      $matchnonzerocolref = $newcolref;
+    } elsif ($valuename eq '$MATCHEQUAL') {
+      if (!defined($valuevar)) {
+	die "The '\$MATCHEQUAL' value spec must specify a column!\n";
+      }
+      $matchequalcolref = $newcolref;
+      $matchequalvalue = $valuetext;
+    } elsif ($valuename eq '$DURUNTIL') {
+      if (!defined($valuevar)) {
+	die "The '\$DURUNTIL' value spec must specify a column!\n";
+      }
+      push @duruntilcolrefs, $newcolref;
+      if (defined($durationunits) && $valueunits ne $durationunits) {
+	die "'\$DURUNTIL' units '$valueunits' conflict with previous duration units '$durationunits'\n";
+      }
+      $durationunits = $valueunits;
+    } elsif ($valuename eq '$DURUNTILNEXTROW') {
+      if (!defined($valuevar)) {
+	die "The '\$DURUNTILNEXTROW' value spec must specify a column!\n";
+      }
+      # we are using the "next" row to find end time, so shift down one element
+      my $shiftednewcolref = [@$newcolref];
+      shift @$shiftednewcolref;
+      push @duruntilcolrefs, $shiftednewcolref;
+      if (defined($durationunits) && $valueunits ne $durationunits) {
+	die "'\$DURUNTILNEXTROW' units '$valueunits' conflict with previous duration units '$durationunits'\n";
+      }
+      $durationunits = $valueunits;
+    }
+  }
+  if (defined($firstmritime) && !defined($onsetunits)) {
+    die
+      "If 'firstmritime' is specified, you must specify units for it and all onsets,\nand all units must match.  Didn't find units for onset " .
+	(defined($onsetvar) ? "var '$onsetvar'" : "text '$onsettext'") .
+	  "!\n";
+  }
+  if (defined($firstmritime) && $firstmritimeunits ne $onsetunits) {
+    die
+      "If 'firstmritime' is specified, you must specify units for it and all onsets,\nand all units must match!  Onset " .
+	(defined($onsetvar) ? "var '$onsetvar'" : "text '$onsettext'") .
+	  " units ($onsetunits)\ndoes not match 'firstmritime' units ($firstmritimeunits)!\n";
+  }
+  if (defined($durationunits) && !defined($onsetunits)) {
+    die "If duration units are specified, onset units must be specified also!\n";
+  }
+  if (defined($onsetunits) && defined($durationunits) &&
+      $onsetunits ne $durationunits) {
+    die "Duration and onset units must match!\n";
+  }
+  $revindicesref = [0..($numrows-1)];
+  if (defined($matchcolref)) {
+    @$revindicesref = grep {
+      my $matchval = $matchcolref->[$_];
+      (defined($matchval) &&
+       length($matchval) != 0 &&
+       $matchval ne 'NULL');
+    } @$revindicesref;
+  }
+  if (defined($matchnonzerocolref)) {
+    @$revindicesref = grep {
+      my $matchval = $matchnonzerocolref->[$_];
+      (defined($matchval) &&
+       length($matchval) != 0 &&
+       $matchval ne 'NULL' &&
+       $matchval ne 0);
+    } @$revindicesref;
+  }
+  if (defined($matchequalcolref)) {
+    @$revindicesref = grep {
+      my $matchval = $matchequalcolref->[$_];
+      (defined($matchval) &&
+       $matchval eq $matchequalvalue);
+    } @$revindicesref;
+  }
+  @$revindicesref = grep {
+    my $matchval = $onsetcolref->[$_];
+    (defined($matchval) &&
+     length($matchval) != 0 &&
+     $matchval ne 'NULL');
+  } @$revindicesref;
+  if (@duruntilcolrefs > 0 && defined($onsetcolref)) {
+    my $newdurcolref = undef;
+    for my $tmpcolref (@duruntilcolrefs) {
+      if (!defined($newdurcolref)) {
+	$newdurcolref = [@$tmpcolref];
+      } else {
+	my $minlistlen = @$newdurcolref;
+	if (@$tmpcolref < $minlistlen) {
+	  $minlistlen = @$tmpcolref;
+	}
+	@{$newdurcolref}[0..$minlistlen-1] =
+	  map {
+	    my $durvalue = $newdurcolref->[$_];
+	    my $tmpvalue = $tmpcolref->[$_];
+	    if (defined($durvalue) && ($durvalue =~ /^[0123456789.]+$/)) {
+	      $durvalue;
+	    } else {
+	      $tmpcolref->[$_];
+	    }
+	  } (0..$minlistlen-1);
+	if (@$tmpcolref > @$newdurcolref) {
+	  @{$newdurcolref}[$#$newdurcolref+1..$#$tmpcolref] =
+	    @{$tmpcolref}[$#$newdurcolref+1..$#$tmpcolref];
+	}
+      }
+    }
+    @$newdurcolref = map {
+      my $onset = $onsetcolref->[$_];
+      my $endtime = $newdurcolref->[$_];
+      if (!defined($endtime) || !defined($onset) ||
+	  $endtime !~ /^[0123456789.]+$/ || $onset !~ /^[0123456789.]+$/) {
+	undef
+      } else {
+	$endtime - $onset;
+      }
+    } (0..$#$newdurcolref);
+    push @$eventref, ['$duration', undef, undef, $durationunits ];
+    $colhashref->{'$duration'} = $newdurcolref;
+    $durationcolref = $newdurcolref;
+  }
+
+  my $indicesref = [(-1) x $numrows];
+  my $tmpind = 0;
+  grep { $indicesref->[$_] = $tmpind++ } @$revindicesref;
+
+  for my $key (keys %$colhashref) {
+    my $colref = $colhashref->{$key};
+#    my @undefinds = map { if (!defined($colref->[$_])) { $_ } else { () }; } @$revindicesref;
+#    if (@undefinds) {
+#      die "Found undefined value using event command #$eventnum for value name '$key' in rows: ", join(" ", @undefinds), "\n";
+#    }
+    @$colref = @$colref[@$revindicesref];
+  }
+
+  if (defined($onsetunits) &&
+      ($onsetunits eq 'msec' || $onsetunits eq 'msecs' || $onsetunits eq 'ms')) {
+    $unitshashref->{'$onset'} = 'sec';
+    @$onsetcolref = map { $_ / 1000.0 } @$onsetcolref;
+    if (defined($durationcolref)) {
+      @$durationcolref = map { if (defined($_)) { $_ / 1000.0 } else { undef } } @$durationcolref;
+    }
+  } elsif (defined($onsetunits) &&
+	   ($onsetunits eq 'dmsec' || $onsetunits eq 'dmsecs' || $onsetunits eq 'dms')) {
+    $unitshashref->{'$onset'} = 'sec';
+    @$onsetcolref = map { $_ / 10000.0 } @$onsetcolref;
+    if (defined($durationcolref)) {
+      @$durationcolref = map { if (defined($_)) { $_ / 10000.0 } else { undef } } @$durationcolref;
+    }
+  }
+  if (defined($firstmritime)) {
+    if ($firstmritimeunits eq 'msec' ||
+	$firstmritimeunits eq 'msecs' ||
+	$firstmritimeunits eq 'ms') {
+      @$onsetcolref = map { $_ -= ($firstmritime / 1000.0) } @$onsetcolref;
+    } elsif ($firstmritimeunits eq 'dmsec' ||
+	     $firstmritimeunits eq 'dmsecs' ||
+	     $firstmritimeunits eq 'dms') {
+      @$onsetcolref = map { $_ -= ($firstmritime / 10000.0) } @$onsetcolref;
+    } else {
+      @$onsetcolref = map { $_ -= $firstmritime } @$onsetcolref;
+    }
+  }
+  @$onsetcolref = map { $_ -= $opt_subtractonset } @$onsetcolref;
+
+  @$eventref = grep {
+    my $eventname = $_->[0];
+    !(grep { "\$$_" eq $eventname } @magiceventnames);
+  } @$eventref;
+
+  unshift @$eventref, $colhashref;
+  unshift @$eventref, $indicesref;
+  unshift @$eventref, $unitshashref;
+}
+
+
+for my $oldrownum (0..($numrows-1)) {
+  for my $eventref (@eventlist) {
+    my $unitshashref = $eventref->[0];
+    my $indicesref = $eventref->[1];
+    my $colhashref = $eventref->[2];
+    my $typestr = '';
+    my $unitsstr = '';
+    my $rownum = $indicesref->[$oldrownum];
+    next if ($rownum < 0);
+    if (exists($colhashref->{'$type'}) && defined($colhashref->{'$type'}) && defined($colhashref->{'$type'}->[$rownum])) {
+      $typestr = " type='$colhashref->{'$type'}->[$rownum]'";
+    }
+    if (exists($unitshashref->{'$onset'}) && defined($unitshashref->{'$onset'}) && defined($colhashref->{'$onset'}->[$rownum])) {
+      $unitsstr = " units='$unitshashref->{'$onset'}'";
+    }
+    print $outfh "  <event$typestr$unitsstr>\n";
+    if (exists($colhashref->{'$name'}) && defined($colhashref->{'$name'}) && defined($colhashref->{'$name'}->[$rownum])) {
+      print $outfh "    <name>$colhashref->{'$name'}->[$rownum]</name>\n";
+    }
+    if (exists($colhashref->{'$description'}) && defined($colhashref->{'$description'}) && defined($colhashref->{'$description'}->[$rownum])) {
+      print $outfh "    <description>$colhashref->{'$description'}->[$rownum]</description>\n";
+    }
+    if (exists($colhashref->{'$onset'}) && defined($colhashref->{'$onset'}) && defined($colhashref->{'$onset'}->[$rownum])) {
+      print $outfh "    <onset>$colhashref->{'$onset'}->[$rownum]</onset>\n";
+    }
+    if (exists($colhashref->{'$duration'}) && defined($colhashref->{'$duration'}) && defined($colhashref->{'$duration'}->[$rownum])) {
+      print $outfh "    <duration>$colhashref->{'$duration'}->[$rownum]</duration>\n";
+    }
+    for my $valueref (@{$eventref}[3..$#$eventref]) {
+      my ($valuename, $valuevar, $valuetext, $valueunits) = @$valueref;
+      my $valuecolref = $colhashref->{$valuename};
+      next if !defined($valuecolref->[$rownum]);
+      next if length($valuecolref->[$rownum]) == 0;
+      next if $valuecolref->[$rownum] eq 'NULL';
+      my $unitsstr = '';
+      if (defined($valueunits)) {
+	$unitsstr = " units='$valueunits'";
+      }
+      if (substr($valuename,0,1) eq '$') { #'
+	die "internal error: should never get here!\n";
+      } else {
+	$valuename = substr($valuename,1); # get rid of '%'
+	print $outfh "    <value name='$valuename'$unitsstr>$valuecolref->[$rownum]</value>\n";
+      }
+    }
+    print $outfh "  </event>\n";
+  }
+}
+for my $valueref (@blocklist) {
+  my ($valuename, $valuevar) = @$valueref;
+}
+if ($opt_xcede2) {
+  print $outfh <<EOM;
+  </data>
+</XCEDE>
+EOM
+} else {
+  print $outfh <<EOM;
+</events>
+EOM
+}
+
+# $Log: In-line log eliminated on transition to SVN; use svn log instead. $
+# Revision 1.26  2008/03/10 22:09:33  gadde
+# Don't lop off first character of valuename in "@TEXT" fields.
+#
+# Revision 1.25  2007/10/31 17:46:37  gadde
+# Don't give incorrect usage information for 3column2xml.
+#
+# Revision 1.24  2007/10/30 16:28:17  gadde
+# Use units.
+#
+# Revision 1.23  2007/10/30 16:06:30  gadde
+# Add 3column2xml.
+#
+# Revision 1.22  2007/05/21 16:45:56  gadde
+# Fix bug introduced in 1.20.
+#
+# Revision 1.21  2007/05/15 14:56:20  gadde
+# Support "deci-milliseconds" (as Presentation uses by default?)
+#
+# Revision 1.20  2007/05/10 20:57:02  gadde
+# Don't die on undefined data (like for DURUNTILNEXTROW when the next
+# row doesn't exist).  Just silently ignore.
+#
+# Revision 1.19  2006/02/08 19:05:16  gadde
+# Be explicit about floating point numbers
+#
+# Revision 1.18  2006/02/08 19:02:35  gadde
+# Support $DURUNTIL and $DURUNTILNEXTROW; also update comments
+#
+# Revision 1.17  2005/12/09 17:16:43  gadde
+# Avoid "split"s default trimming of empty trailing elements.
+#
+# Revision 1.16  2005/11/17 21:12:06  gadde
+# Add two options to extract just text table or column names.
+#
+# Revision 1.15  2005/11/17 18:22:59  gadde
+# Add level name "instance indices" as columns.  Also, if column names occur
+# in multiple levels, append the level name in brackets [] to the name.
+#
+# Revision 1.14  2005/11/17 16:08:19  gadde
+# Add [Level] to Running and Procedure column names.
+#
+# Revision 1.13  2005/11/01 22:15:28  gadde
+# Updates to support "LogFrame" text E-Prime output.
+#
+# Revision 1.12  2005/09/19 16:31:58  gadde
+# Documentation and help message updates.
+#
+# Revision 1.11  2005/09/01 15:15:53  gadde
+# Be a little more careful with checking column hash values.
+#
+# Revision 1.10  2005/06/15 18:15:26  gadde
+# Fix quote matching code.
+#
+# Revision 1.9  2005/06/07 20:41:28  gadde
+# Added support for Presentation files.
+# An update to the syntax to allow spaces in column names.  Now text
+# strings must be preceded by @.  As a result quotes are now optional
+# for text strings, and are allowed for column names.
+# Quotes can be used anywhere in the text strings or column names to
+# protect portions of the string.
+# More robust in the face of undefined values/missing columns.
+# Added $MATCHEQUAL magic value name.
+#
+# Revision 1.8  2005/06/03 15:17:30  gadde
+# Update eprime2xml to work more generically if linked as 'eventstable2xml'
+#
+# Revision 1.7  2005/03/07 20:27:53  gadde
+# Put help in single quotes (so we don't have to protect $ and %).
+#
+# Revision 1.6  2005/03/07 19:56:05  gadde
+# Escape illegal XML characters.
+# Remove % prefix from valuenames on output.
+# Don't need to escape '$' in a single-quoted string.
+# Add single-quotes around event units' value.
+#
+# Revision 1.5  2005/03/03 20:06:36  gadde
+# Protect some more '$'s in help message.
+#
+# Revision 1.4  2005/02/28 21:39:14  gadde
+# Move from '_' to '$' and '%' in prefixes for magic/non-magic values.
+# Also add CVS Log.
+#

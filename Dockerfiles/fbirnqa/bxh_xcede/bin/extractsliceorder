@@ -1,0 +1,208 @@
+#!/usr/bin/perl -w
+
+# Extract slice acquisition order from a BXH/XCEDE file
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use BXHPerlUtils;
+
+my $usage = <<EOM;
+Usage:  extractsliceorder.pl [options] INPUT.bxh [OUTFILE]
+
+This tool extracts slice acquisition order from a BXH/XCEDE file and writes
+it out in formats usable by fMRI processing tools.  You must provide options
+to specify the output format.  OUTFILE may be unspecified or '-' to write to
+standard output.
+
+General options:
+  --help
+        print this message.
+  --overwrite
+        overwrite any existing files.
+
+Shortcuts:
+  --fsl
+        For FSL tools.  Will write out a one-column slice order file (this
+        is currently the default).
+  --desc
+        For humans.  Will write out an English string describing the slice
+        order.
+
+Output modifiers:
+  --fieldsep <str>
+  --fieldsep=<str>
+        This option sets the field separator, which is a new line ('\n') by
+        default.  The backslash character '\\' is an escape character to allow
+        '\\t' to indicate a tab and '\\n' to indicate a newline.  To specify a
+        single backslash, use '\\\\'.  For any character X where X is not 't',
+        'n', or a backslash '\\', the sequence '\\X' is equivalent to 'X'.
+EOM
+
+my $opt_overwrite = 0;
+my $opt_desc = 0;
+my $opt_fieldsep = '\n';
+
+my @savedARGV = @ARGV;
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+my @optdata = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    push @optdata, ["--"];
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)(.*))?$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  my $usedoptarg = 0;
+  if ($opt eq 'help') {
+    print STDERR $usage;
+    exit(-1);
+  } elsif ($opt eq 'overwrite' && !defined($opteq)) {
+    $opt_overwrite++;
+  } elsif ($opt eq 'desc' && !defined($opteq)) {
+    $opt_desc++;
+  } elsif ($opt eq 'fsl' && !defined($opteq)) {
+    unshift @oldARGV, '--fieldsep=\n';
+  } elsif ($opt eq 'fieldsep' && defined($optarg)) {
+    shift @oldARGV; $usedoptarg = 1;
+    $opt_fieldsep = $optarg;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+}
+
+if (scalar(@ARGV) != 1 && scalar(@ARGV) != 2) {
+  die "Error: wrong number of arguments!\n" . $usage;
+}
+
+$opt_fieldsep =~ s/\\t/\t/g;
+$opt_fieldsep =~ s/\\n/\n/g;
+$opt_fieldsep =~ s/\\(.)/$1/g;
+
+my $inputfile = $ARGV[0];
+my $outputfile = '-';
+if (scalar(@ARGV) == 2) {
+  $outputfile = $ARGV[1];
+}
+
+if (!$opt_overwrite && $outputfile ne '-' && -e $outputfile) {
+  die "Error: '${outputfile}' exists!\n";
+}
+
+my $meta = readxmlmetadata($inputfile);
+
+if (!exists($meta->{'sliceorder'})) {
+  die "Error: could not find slice order in input file '" . $inputfile . "'\n";
+}
+
+my $numslices = $meta->{'dims'}->{'z'}->{'size'};
+my @sliceorder = @{$meta->{'sliceorder'}};
+my @sortedsliceorder = sort { $a <=> $b } @sliceorder;
+if ($sortedsliceorder[0] != 1 || $sortedsliceorder[$#sortedsliceorder] != $numslices || grep { $sortedsliceorder[$_-1] == $sortedsliceorder[$_]} (1..$#sortedsliceorder)) {
+  die "Incorrect sliceorder field: '" . join(',', @sliceorder) . "'.  Must contain all the numbers from 1 to ${numslices}.\n";
+}
+
+if ($opt_desc) {
+  my @increasing = (1..$numslices);
+  my @decreasing = reverse @increasing;
+  my @incodd = ();
+  for (my $i = 1; $i <= $numslices; $i += 2) {
+    push @incodd, $i;
+  }
+  my @inceven = ();
+  for (my $i = 2; $i <= $numslices; $i += 2) {
+    push @inceven, $i;
+  }
+  my @decodd = reverse(@incodd);
+  my @deceven = reverse(@inceven);
+  my @oddevenincreasing = (@incodd, @inceven);
+  my @evenoddincreasing = (@inceven, @incodd);
+  my @oddevendecreasing = (@decodd, @deceven);
+  my @evenodddecreasing = (@deceven, @decodd);
+  my $incordec = undef;
+  my $seqorint = undef;
+  my $oddeven = undef;
+  my $arraycmp = sub {
+    my ($a, $b) = @_;
+    return 0 unless @$a == @$b;
+    for (my $i = 0; $i < scalar(@$a); $i++) {
+      return 0 if $a->[$i] != $b->[$i];
+    }
+    return 1;
+  };
+  if ($arraycmp->(\@sliceorder, \@increasing)) {
+    $incordec = 'increasing';
+    $seqorint = 'sequential';
+  } elsif ($arraycmp->(\@sliceorder, \@decreasing)) {
+    $incordec = 'decreasing';
+    $seqorint = 'sequential';
+  } elsif ($arraycmp->(\@sliceorder, \@oddevenincreasing)) {
+    $incordec = 'increasing';
+    $seqorint = 'interleaved';
+    $oddeven = 'odds then evens';
+  } elsif ($arraycmp->(\@sliceorder, \@evenoddincreasing)) {
+    $incordec = 'increasing';
+    $seqorint = 'interleaved';
+    $oddeven = 'evens then odds';
+  } elsif ($arraycmp->(\@sliceorder, \@oddevendecreasing)) {
+    $incordec = 'decreasing';
+    $seqorint = 'interleaved';
+    $oddeven = 'odds then evens';
+  } elsif ($arraycmp->(\@sliceorder, \@evenodddecreasing)) {
+    $incordec = 'decreasing';
+    $seqorint = 'interleaved';
+    $oddeven = 'evens then odds';
+  }
+  if (!defined($incordec) || !defined($seqorint)) {
+    print STDOUT "Slice acquisition order is indescribable: " . join(",", @sliceorder) . "\n";
+    exit 0;
+  }
+  my $dirlabel = undef;
+  my $zdimref = $meta->{'dims'}->{'z'};
+  if ($incordec eq 'increasing') {
+    $dirlabel = $zdimref->{'startlabel'} . " to " . $zdimref->{'endlabelz'};
+  } elsif ($incordec eq 'decreasing') {
+    $dirlabel = $zdimref->{'endlabelz'} . " to " . $zdimref->{'startlabel'};
+  }
+  my $fh = undef;
+  if ($outputfile eq '-') {
+    $fh = \*STDOUT;
+  } else {
+    open($fh, '>', $outputfile) || die "Error opening '$outputfile'\n";
+  }
+  print $fh "Slice acquisition order is $dirlabel, $seqorint";
+  if ($seqorint eq 'interleaved') {
+    print $fh ", $oddeven";
+  }
+  print $fh ": " . join(",", @sliceorder) . "\n";
+  if ($outputfile ne '-') {
+    close $fh;
+  }
+  exit 0;
+}
+
+my $fh = undef;
+if ($outputfile eq '-') {
+  $fh = \*STDOUT;
+} else {
+  open($fh, '>', $outputfile) || die "Error opening '$outputfile'\n";
+}
+print $fh join($opt_fieldsep, @sliceorder), "\n";
+if ($outputfile ne '-') {
+  close $fh;
+}

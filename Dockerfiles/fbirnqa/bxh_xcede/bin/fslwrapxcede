@@ -1,0 +1,32 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+my $usage = <<EOM;
+Usage:
+  fslwrapbxh paths...
+
+Specify any number of data files or directories as arguments and this script
+will wrap any .nii or .nii.gz files it sees with .bxh files.
+EOM
+
+if (scalar(@ARGV) < 1) {
+  die $usage;
+}
+
+while (@ARGV) {
+  my $datadir = shift @ARGV;
+  open(FIND, "find '$datadir' '(' -name '*.nii' -o -name '*.nii.gz' ')' |") ||
+    die "Error running find: $!\n";
+  while (<FIND>) {
+    chomp;
+    my $bxhfile = $_;
+    $bxhfile =~ s/.nii(.gz)?$/.bxh/;
+    if (! -e $bxhfile) {
+      my @cmd = ('analyze2bxh', '--xcede', $_, $bxhfile);
+      print STDOUT join(' ', @cmd), "\n";
+      system @cmd;
+    }
+  }
+  close FIND;
+}

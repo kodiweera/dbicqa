@@ -1,0 +1,421 @@
+#!/usr/bin/perl -w
+
+# This program converts metadata stored in Gary Glover's "F"-file
+# into a BXH file.  Usage:
+#   ffile2bxh [ --dimorder "x,y,t,z" ] ffile datafile1... output.bxh
+# datafile* is (are) the reconstructed data file(s).
+# The --dimorder option specifies the order of dimensions in
+# datafile.mag, as a comma-separated list.  Default is "x,y,z,t".
+
+my $cvsid = '$Id: ffile2bxh,v 1.13 2005-12-02 17:56:13 gadde Exp $ ';
+
+use strict;
+use File::Spec;
+
+my $opt_dimorder = "x,y,z,t";
+my $opt_byteorder = undef;
+my $opt_xcede = 0;
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+while ($#oldARGV >= 0) {
+  my $arg = shift @oldARGV;
+  ($arg =~ /--dimorder/) && do { $opt_dimorder = shift @oldARGV; next; };
+  ($arg =~ /--byteorder/) && do { $opt_byteorder = shift @oldARGV; next; };
+  ($arg =~ /--xcede/) && do { $opt_xcede++; next; };
+  push @ARGV, $arg;
+}
+
+if ($#ARGV < 1) {
+  print STDERR "Usage:\n";
+  print STDERR "  ffile2bxh [ --dimorder \"x,y,z,t\" ] ffile [datafile1...] outputfile\n\n";
+  print STDERR "This program takes a Stanford F-file and creates a BXH or XCEDE header using\n";
+  print STDERR "the metadata in the F-file, and points to the image data in the given\n";
+  print STDERR "datafiles.\n";
+  print STDERR "  --dimorder specifies the comma-separated names of the dimensions in the\n";
+  print STDERR "             datafiles(s) in order from fastest-moving to slowest-moving\n";
+  print STDERR "             Default is \"x,y,z,t\".\n\n";
+  print STDERR "  --xcede produces an XCEDE file as output.\n";
+  exit();
+}
+
+my ($ffile, @datafiles) = @ARGV;
+my ($outputbxh) = pop @datafiles;
+
+if (-e $outputbxh) {
+  print STDERR "Error: output file \"$outputbxh\" exists!\n";
+  exit();
+}
+
+open(FFH, "$ffile") || die "open(\"$ffile\"): $!";
+
+my %ffields = ();
+
+while (<FFH>) {
+  chomp;
+  s/^\s+//;
+  s/\s+$//;
+  next if length($_) == 0;
+  my ($name, $value);
+  if (/([^=]+?)\s*=\s*(.*)/) {
+    ($name, $value) = ($1, $2);
+  } else {
+    ($name, $value) = /(\S+)(?:\s+(.*))?/;
+  }
+  if (!defined($value)) {
+    $value = "";
+  }
+  if (exists $ffields{$name}) {
+    if (!ref($ffields{$name})) {
+      my $oldval = $ffields{$name};
+      $ffields{$name} = [$oldval];
+    }
+    push @{$ffields{$name}}, $value;
+  } else {
+    $ffields{$name} = $value;
+  }
+}
+
+$ffields{"TR"} =~ s/\s*msec\s*//;
+$ffields{"TE"} =~ s/\s*msec\s*//;
+$ffields{"time/frame"} =~ s/\s*msec\s*//;
+
+my @firstbottomright = split(/\s+/, ${$ffields{"gw_point1"}}[0]);
+my @firsttopright = split(/\s+/, ${$ffields{"gw_point2"}}[0]);
+my @firstbottomleft = split(/\s+/, ${$ffields{"gw_point3"}}[0]);
+my @lastbottomright = split(/\s+/, ${$ffields{"gw_point1"}}[$#{$ffields{"gw_point3"}}]);
+
+my ($Xr, $Xa, $Xs) =
+  ($firstbottomright[0] - $firstbottomleft[0],
+   $firstbottomright[1] - $firstbottomleft[1],
+   $firstbottomright[2] - $firstbottomleft[2]);
+my ($Yr, $Ya, $Ys) =
+  ($firstbottomright[0] - $firsttopright[0],
+   $firstbottomright[1] - $firsttopright[1],
+   $firstbottomright[2] - $firsttopright[2]);
+my ($Zr, $Za, $Zs) =
+  ($lastbottomright[0] - $firstbottomright[0],
+   $lastbottomright[1] - $firstbottomright[1],
+   $lastbottomright[2] - $firstbottomright[2]);
+
+my $Xlen = sqrt($Xr*$Xr + $Xa*$Xa + $Xs*$Xs);
+my $Ylen = sqrt($Yr*$Yr + $Ya*$Ya + $Ys*$Ys);
+my $Zlen = sqrt($Zr*$Zr + $Za*$Za + $Zs*$Zs);
+
+$Xr /= $Xlen;
+$Xa /= $Xlen;
+$Xs /= $Xlen;
+$Yr /= $Ylen;
+$Ya /= $Ylen;
+$Ys /= $Ylen;
+$Zr /= $Zlen;
+$Za /= $Zlen;
+$Zs /= $Zlen;
+
+my $orientation = "";
+if (abs($Zr) != 1 && abs($Za) != 1 && abs($Zs) != 1) {
+  $orientation .= "oblique ";
+}
+if (abs($Zr) > abs($Za) && abs($Zr) > abs($Zs)) {
+  $orientation .= "sagittal";
+} elsif (abs($Za) > abs($Zr) && abs($Za) > abs($Zs)) {
+  $orientation .= "coronal";
+} elsif (abs($Zs) > abs($Zr) && abs($Zs) > abs($Za)) {
+  $orientation .= "axial";
+}
+
+#my @dimdirs = ([$Xr, $Xa, $Xs], [$Yr, $Ya, $Ys], [$Zr, $Za, $Zs]);
+my @dimdirs =
+  ([split(/\s+/, $ffields{"AcqPlane[x]"})],
+   [split(/\s+/, $ffields{"AcqPlane[y]"})],
+   [split(/\s+/, $ffields{"AcqPlane[z]"})]);
+
+# the AcqPlane matrix seems to be transposed...
+my $tmp = $dimdirs[1]->[2];
+$dimdirs[1]->[2] = $dimdirs[2]->[1];
+$dimdirs[2]->[1] = $tmp;
+
+my @firsttopleft = ();
+$firsttopleft[0] =
+  $firstbottomright[0] -
+  $ffields{"Matrix_X"} * $ffields{"PixelSpacing_X"} * $dimdirs[0]->[0] -
+  $ffields{"Matrix_Y"} * $ffields{"PixelSpacing_Y"} * $dimdirs[1]->[0];
+$firsttopleft[1] =
+  $firstbottomright[1] -
+  $ffields{"Matrix_X"} * $ffields{"PixelSpacing_X"} * $dimdirs[0]->[1] -
+  $ffields{"Matrix_Y"} * $ffields{"PixelSpacing_Y"} * $dimdirs[1]->[1];
+$firsttopleft[2] =
+  $firstbottomright[2] -
+  $ffields{"Matrix_X"} * $ffields{"PixelSpacing_X"} * $dimdirs[0]->[2] -
+  $ffields{"Matrix_Y"} * $ffields{"PixelSpacing_Y"} * $dimdirs[1]->[2];
+
+my @dimorigin = (); # RAS coordinates, but in XYZ order
+for (my $dimind = 0; $dimind < 3; $dimind++) {
+  my $maxdir = 0;
+  if (abs($dimdirs[$dimind]->[1]) > abs($dimdirs[$dimind]->[$maxdir])) {
+    $maxdir = 1;
+  }
+  if (abs($dimdirs[$dimind]->[2]) > abs($dimdirs[$dimind]->[$maxdir])) {
+    $maxdir = 2;
+  }
+  $dimorigin[$dimind] = $firsttopleft[$maxdir];
+}
+$dimorigin[3] = 0;
+
+# correct origin to point to center of voxel
+$dimorigin[0] +=
+  0.5 * $ffields{"PixelSpacing_X"} * $dimdirs[0]->[0] +
+  0.5 * $ffields{"PixelSpacing_Y"} * $dimdirs[1]->[0];
+$dimorigin[1] +=
+  0.5 * $ffields{"PixelSpacing_X"} * $dimdirs[0]->[1] +
+  0.5 * $ffields{"PixelSpacing_Y"} * $dimdirs[1]->[1];
+$dimorigin[2] +=
+  0.5 * $ffields{"PixelSpacing_X"} * $dimdirs[0]->[2] +
+  0.5 * $ffields{"PixelSpacing_Y"} * $dimdirs[1]->[2];
+
+my @rasorigin = ();
+for (my $dimind = 0; $dimind < 3; $dimind++) {
+  my $maxdir = 0;
+  if (abs($dimdirs[$dimind]->[1]) > abs($dimdirs[$dimind]->[$maxdir])) {
+    $maxdir = 1;
+  }
+  if (abs($dimdirs[$dimind]->[2]) > abs($dimdirs[$dimind]->[$maxdir])) {
+    $maxdir = 2;
+  }
+  $rasorigin[$maxdir] = $dimorigin[$dimind];
+}
+
+my $dimensionelems = "";
+my @dimnames = split(/,/, $opt_dimorder);
+foreach my $dimname (@dimnames) {
+  my $canondimnum = -1;
+  if ($dimname eq 'x') {
+    $canondimnum = 0;
+  } elsif ($dimname eq 'y') {
+    $canondimnum = 1;
+  } elsif ($dimname eq 'z') {
+    $canondimnum = 2;
+  } elsif ($dimname eq 't') {
+    $canondimnum = 3;
+  }
+  $dimname = lc($dimname);
+  if ($dimname !~ /^[xyzt]$/) {
+    print STDERR "Dimension names must be x, y, z, or t!\n";
+    exit();
+  }
+  my $dimunits = "mm";
+  if ($dimname eq "t") { $dimunits = "ms" };
+  my $dimsize = $ffields{"Matrix_" . uc($dimname)};
+  my $dimgap = 0;
+  my $dimspacing = 0;
+  my $spacingnote = "";
+  if ($dimname =~ /^[xy]$/) {
+    $dimspacing = $ffields{"PixelSpacing_" . uc($dimname)};
+  } elsif ($dimname eq 'z') {
+    my $sum = 0;
+    my @lastbottomright = ();
+    for my $slicenum (0..$dimsize-1) {
+      my @bottomright = split(/\s+/, ${$ffields{"gw_point1"}}[$slicenum]);
+      if ($slicenum != 0) {
+	my @diffs = ($bottomright[0] - $lastbottomright[0],
+		    $bottomright[1] - $lastbottomright[1],
+		    $bottomright[2] - $lastbottomright[2]);
+	$sum += sqrt($diffs[0] * $diffs[0] +
+		     $diffs[1] * $diffs[1] +
+		     $diffs[2] * $diffs[2]);
+      }
+      @lastbottomright = @bottomright;
+    }
+    $dimspacing = $sum / ($dimsize - 1);
+    if (abs($dimspacing - $ffields{"PixelSpacing_Z"}) > 0) {
+      $spacingnote = "<!-- NOTE: calculated slice spacing differs from recorded spacing -->\n      ";
+    }
+  } else {
+    $dimspacing = $ffields{"time/frame"};
+  }
+  my $directionelem = "";
+  if ($dimname =~ /^[xyz]$/) {
+    $directionelem = "<direction>" . join(" ", map {sprintf("%g", $_)} @{$dimdirs[$canondimnum]}) . "</direction>";
+  }
+  $dimensionelems .= <<EOM;
+    <dimension type="$dimname">
+      <units>$dimunits</units>
+      <size>$dimsize</size>
+      <origin>$dimorigin[$canondimnum]</origin>
+      <gap>$dimgap</gap>
+      $spacingnote<spacing>$dimspacing</spacing>
+      $directionelem
+    </dimension>
+EOM
+}
+
+my $fileelems = "";
+my ($ovolume, $odirectories, $ofile) = File::Spec->splitpath($outputbxh);
+my $opath = File::Spec->catpath($ovolume, $odirectories, "");
+foreach my $datafile (@datafiles) {
+  my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
+      $atime, $mtime, $ctime, $blksize, $blocks) = stat($datafile);
+  my ($dvolume, $ddirectories, $dfile) = File::Spec->splitpath($datafile);
+  my $dpath = File::Spec->catpath($dvolume, $ddirectories, "");
+  if ($dpath eq $opath) {
+    $datafile = $dfile;
+  }
+  $fileelems .= <<EOM;
+    <filename>$datafile</filename>
+    <fileoffset>0</fileoffset>
+    <filerecordsize>$size</filerecordsize>
+EOM
+}
+
+my $studydate = "";
+if (exists($ffields{"StudyDate"})) {
+  my @studydate = split(m%/%, $ffields{"StudyDate"});
+  $studydate[2] += 1900;
+  $studydate = "$studydate[2]-$studydate[0]-$studydate[1]";
+}
+
+my $studytime = "";
+if (exists($ffields{"StudyTime"})) {
+  my @studytime = split(m%:%, $ffields{"StudyTime"});
+  if ($#studytime < 2) {
+    $studytime[2] = "00";
+  }
+  $studytime = join(":", @studytime);
+}
+
+my $byteorder = "";
+if ($ffields{"BigEndian"} == 0) {
+  $byteorder = "lsbfirst";
+} else {
+  $byteorder = "msbfirst";
+}
+
+if (defined($opt_byteorder)) {
+  $byteorder = $opt_byteorder;
+}
+
+$ffields{'ExamNumber'} = "" if !exists($ffields{'ExamNumber'});
+$ffields{'SeriesNumber'} = "" if !exists($ffields{'SeriesNumber'});
+$ffields{'RunNumber'} = "" if !exists($ffields{'RunNumber'});
+$ffields{'ScanningSequence'} = "" if !exists($ffields{'ScanningSequence'});
+$ffields{'SequenceVariant'} = "" if !exists($ffields{'SequenceVariant'});
+$ffields{'FieldStrength'} = "" if !exists($ffields{'FieldStrength'});
+$ffields{'ExamDescription'} = "" if !exists($ffields{'ExamDescription'});
+$ffields{'TR'} = "" if !exists($ffields{'TR'});
+$ffields{'TE'} = "" if !exists($ffields{'TE'});
+$ffields{'PixelSpacing'} = "" if !exists($ffields{'PixelSpacing'});
+$ffields{'PatientName'} = "" if !exists($ffields{'PatientName'});
+$ffields{'PatientAge'} = "" if !exists($ffields{'PatientAge'});
+$ffields{'ScannerID'} = "" if !exists($ffields{'ScannerID'});
+$ffields{'ExamDescription'} = "" if !exists($ffields{'ExamDescription'});
+
+open(BXHFH, ">$outputbxh") || die "open(\"$outputbxh\"): $!";
+
+if ($opt_xcede) {
+  print BXHFH <<EOM;
+<?xml version="1.0"?>
+<serieslevel xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://nbirn.net/Resources/Users/Applications/xcede/" xmlns:xcede="http://nbirn.net/Resources/Users/Applications/xcede/">
+  <subject>
+    <name>$ffields{"PatientName"}</name>
+    <sex>other</sex>
+  </subject>
+  <visit>
+    <subjectVar>
+      <age agetype="postnatal" units="years">$ffields{"PatientAge"}</age>
+    </subjectVar>
+  </visit>
+  <scanner>
+    <model>$ffields{"ScannerID"}</model>
+  </scanner>
+  <expProtocol>
+    <name>$ffields{"ExamDescription"}</name>
+  </expProtocol>
+  <acqProtocol>
+    <name/>
+    <acqParam name="examnumber" type="integer">$ffields{"ExamNumber"}</acqParam>
+    <acqParam name="seriesnumber" type="integer">$ffields{"SeriesNumber"}</acqParam>
+    <acqParam name="runnumber" type="integer">$ffields{"RunNumber"}</acqParam>
+    <acqParam name="scanningsequence" type="varchar">$ffields{"ScanningSequence"}</acqParam>
+    <acqParam name="sequencevariant" type="varchar">$ffields{"SequenceVariant"}</acqParam>
+    <acqParam name="magneticfield" type="float">$ffields{"FieldStrength"}</acqParam>
+    <acqParam name="description" type="varchar">$ffields{"ExamDescription"}</acqParam>
+    <acqParam name="scandate" type="varchar">$studydate</acqParam>
+    <acqParam name="scantime" type="varchar">$studytime</acqParam>
+    <acqParam name="tr" type="float">$ffields{"TR"}</acqParam>
+    <acqParam name="te" type="float">$ffields{"TE"}</acqParam>
+    <acqParam name="flipangle" type="float">$ffields{"FlipAngle"}</acqParam>
+    <acqParam name="prescribedslicespacing" type="float">$ffields{"PixelSpacing_Z"}</acqParam>
+  </acqProtocol>
+  <datarec type="image">
+    <rasorigin>$rasorigin[0] $rasorigin[1] $rasorigin[2]</rasorigin>
+$dimensionelems
+    <byteorder>$byteorder</byteorder>
+    <elementtype>int16</elementtype>
+$fileelems
+  </datarec>
+  <provenance>
+    <processStep>
+      <programName>'$0'</programName>
+      <programArgument>F-File '$ffile'</programArgument>
+      <version></version>
+      <timeStamp>2003-08-01 08:51:13</timeStamp>
+      <cvs></cvs>
+      <user/>
+      <machine>$ENV{"HOST"}</machine>
+      <platform/>
+      <platformVersion/>
+    </processStep>
+  </provenance>
+</serieslevel>
+EOM
+} else {
+  print BXHFH <<EOM;
+<?xml version="1.0"?>
+<!-- This is a BXH (BIAC XML Header) file. -->
+<bxh xmlns:bxh="http://www.biac.duke.edu/bxh" xmlns="http://www.biac.duke.edu/bxh" version="1.0">
+  <datarec type="image">
+    <!--AUTOGEN: Orientation is $orientation -->
+$dimensionelems
+    <byteorder>$byteorder</byteorder>
+    <elementtype>int16</elementtype>
+$fileelems
+  </datarec>
+  <acquisitiondata>
+    <examnumber>$ffields{"ExamNumber"}</examnumber>
+    <seriesnumber>$ffields{"SeriesNumber"}</seriesnumber>
+    <runnumber>$ffields{"RunNumber"}</runnumber>
+    <institution>Stanford Univ.</institution>
+    <magneticfield>$ffields{"FieldStrength"}</magneticfield>
+    <description>$ffields{"ExamDescription"}</description>
+    <scandate>$studydate</scandate>
+    <scantime>$studytime</scantime>
+    <scanner>$ffields{"ScannerID"}</scanner>
+    <fieldofview>$ffields{"FOV"}</fieldofview>
+    <prescribedslicespacing>$ffields{"PixelSpacing_Z"}</prescribedslicespacing>
+    <tr>$ffields{"TR"}</tr>
+    <te>$ffields{"TE"}</te>
+    <flipangle>$ffields{"FlipAngle"}</flipangle>
+    <nechos>$ffields{"NumberEchoes"}</nechos>
+    <nshots>$ffields{"nshot"}</nshots>
+    <scanningsequence>$ffields{"ScanningSequence"}</scanningsequence>
+    <sequencevariant>$ffields{"SequenceVariant"}</sequencevariant>
+  </acquisitiondata>
+  <subject>
+    <name>$ffields{"PatientName"}</name>
+    <id>$ffields{"PatientId"}</id>
+    <age>$ffields{"PatientAge"}</age>
+    <sex>$ffields{"PatientGender"}</sex>
+    <weight>$ffields{"PatientWeight"}</weight>
+  </subject>
+  <history>
+    <entry>
+      <date>2003-08-01 08:51:13</date>
+      <description>
+Generated on $ENV{"HOST"} by '$0' from F-File '$ffile'.
+$cvsid
+      </description>
+    </entry>
+  </history>
+</bxh>
+EOM
+}

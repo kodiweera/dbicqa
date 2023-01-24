@@ -1,0 +1,170 @@
+#!/usr/bin/env perl
+
+use strict;
+#no strict 'subs';
+
+use FindBin;
+use lib "$FindBin::Bin";
+
+use XML::Twig;
+use XML::Twig::XPath;
+
+use Data::Dumper;
+
+# remove and return the first space-separated field in
+# the input (optionally quoted)
+sub read_field {
+  my ($strref,) = @_;
+  $_ = $$strref;
+  my $normset = '#"\'\s'; 	# delimiter of non-quoted expr
+  my $insquoteset = '\'';	# delimiter inside single-quoted expr
+  my $indquoteset = '"';	# delimiter inside double-quoted expr
+  s/^\s+//;			# ignore leading space
+  my $cset = $normset;
+  my $retval = undef;
+  while (length($_) > 0) {
+    my ($match, $rest) = /^([^$cset]*)(.*)/;
+    if (defined($match)) {
+      if (!defined($retval)) {
+	$retval = '';
+      }
+      $retval .= $match;
+    }
+    $_ = $rest;
+    s/^#.*//;		
+    last if length($_) == 0; # end of line or...
+    last if /^\s/; # ...non-quoted space indicates end of field
+    if (/^\"/) {
+      if ($cset eq $indquoteset) {
+	$cset = $normset;
+      } else {
+	$cset = $indquoteset;
+      }
+    } elsif (/^\'/) {
+      if ($cset eq $insquoteset) {
+	$cset = $normset;
+      } else {
+	$cset = $insquoteset;
+      }
+    }
+    $_ = substr($_, 1);	# get rid of parsed character/delim
+  }
+  s/^\s+//;
+  $$strref = $_;
+  return $retval;
+}
+
+if (scalar(@ARGV) < 2) {
+  die "Usage: $0 instruction_file xcede_files...\n";
+}
+
+my @insts = ();
+
+my $inst_file = shift @ARGV;
+open(FH, $inst_file) || die "Error opening $inst_file: $!\n";
+while (<FH>) {
+  chomp;
+  s/^\s+//;
+  s/\s$//;
+  my $orig = $_;
+  my $line = $_;
+  my $xpath = read_field(\$line);
+  my $replacement = read_field(\$line);
+  my @inst = ();
+  if (length($line) > 0) {
+    die "Garbage in $inst_file at end of line $.: $line\n";
+  }
+  if (length($line) > 0 && !defined($xpath)) {
+    die "Missing XPath expression in $inst_file, line $.\nLine must be:\n<xpath> <optional replacement text>\n";
+  }
+  next if (!defined($xpath));
+  push @inst, $xpath;
+  if (defined($replacement)) {
+    push @inst, $replacement;
+  }
+  push @insts, \@inst;
+}
+close FH;
+
+use constant BAD_MARK_NAME => 'xcedefilter__bad__';
+
+sub handler_remove_text {
+  if ($_->is_text()) {
+    $_->cut();
+    return 1;
+  }
+  next if !$_->is_elt();
+  my @children = $_->children();
+  for my $child (@children) {
+    if ($child->is_text()) {
+      $child->cut();
+    }
+  }
+  @children = $_->children();
+  if (scalar(@children) == 0) {
+    $_->cut();
+  }
+  return 1;
+}
+
+sub handler_replace_text {
+  my ($doctwig, $eltwig, $replacement) = @_;
+  return 1 if !$eltwig->is_elt();
+  my @children = $eltwig->children();
+  for my $child (@children) {
+    if ($child->is_text()) {
+      $child->cut();
+    }
+  }
+  my $newelt = XML::Twig::Elt->new('#PCDATA' => $replacement);
+  $newelt->paste_first_child($_);
+  return 1;
+}
+
+sub handler_mark_good {
+  return 1 if !$_->is_elt();
+  if (defined($_->att(BAD_MARK_NAME))) {
+    $_->del_att(BAD_MARK_NAME);
+  }
+  return 1;
+}
+
+sub handler_mark_bad {
+  $_->set_att((BAD_MARK_NAME) => '1');
+  return 1;
+}
+
+for my $xml_file (@ARGV) {
+# this Twig marks every element as "bad"
+  my $markbadtwig =
+    XML::Twig::XPath->new(twig_handlers => { '_default_' => \&handler_mark_bad });
+  $markbadtwig->parsefile($xml_file);
+  my $markedbad = $markbadtwig->sprint();
+
+  # now mark elements specified in the instruction file as "good"
+  # (and replace their text if replacement text is available)
+  my $markgoodtwig = XML::Twig::XPath->new();
+  $markgoodtwig->parse($markedbad);
+  for my $instref (@insts) {
+    my ($xpath, $replacement) = @$instref;
+    my @matchednodes = $markgoodtwig->findnodes($xpath);
+    for my $node (@matchednodes) {
+      if (defined($replacement)) {
+	local $_ = $node;
+	handler_replace_text($markgoodtwig, $node, $replacement);
+	undef $_;
+      }
+      local $_ = $node;
+      handler_mark_good($markgoodtwig, $node);
+      undef $_;
+    }
+  }
+  my $markedgood = $markgoodtwig->sprint();
+
+  # this Twig erases the text from all remaining "bad" elements
+  my $erasebadtwig =
+    XML::Twig::XPath->new(pretty_print => 'indented',
+			  twig_handlers => { ('*[@' . BAD_MARK_NAME . ']') => sub { handler_remove_text(@_); handler_mark_good(@_); } });
+  $erasebadtwig->parse($markedgood);
+  $erasebadtwig->flush();
+}

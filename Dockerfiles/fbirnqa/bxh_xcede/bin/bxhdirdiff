@@ -1,0 +1,212 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use File::Spec;
+use FindBin;
+use lib "$FindBin::Bin";
+use File::Temp qw/ tempfile /;;
+
+my $usage = <<EOM;
+Usage: $0 [ --exclude PATTERN ]... dir1 dir2
+EOM
+
+my @opt_excludes = ();
+
+my @oldARGV = @ARGV;
+@ARGV = ();
+while (scalar(@oldARGV)) {
+  my $arg = shift @oldARGV;
+  if ($arg =~ /^--$/) {
+    push @ARGV, @oldARGV;
+    last;
+  }
+  if ($arg !~ /^--/) {
+    push @ARGV, $arg;
+    next;
+  }
+  my ($opt, undef, $opteq, $optarg) = ($arg =~ /^--([^=]+)((=)?(.*))$/);
+  if (defined($opteq)) {
+    unshift @oldARGV, $optarg;
+  }
+  if (scalar(@oldARGV) > 0) {
+    $optarg = $oldARGV[0]; # in case option takes argument
+  }
+  if ($opt eq 'help') {
+    die $usage;
+  } elsif ($opt eq 'exclude' && defined($optarg)) {
+    shift @oldARGV;
+    push @opt_excludes, $optarg;
+  } else {
+    die "Unrecognized option '$opt' (or missing argument?)\nUse --help for options.\n";
+  }
+}
+
+if (scalar(@ARGV) != 2) {
+  die $usage;
+}
+
+my ($dirleft, $dirright) = @ARGV;
+
+if (! -d $dirleft || ! -d $dirright) { 
+  die "ERROR: arguments must be directories!\n";
+}
+
+my $retval = 0;
+
+my ($initleftvol, $initleftdir, $initleftfile) = File::Spec->splitpath($dirleft);
+my @initleftdircomps = File::Spec->splitdir($initleftdir);
+my @queueleft = ([$dirleft, $initleftvol, File::Spec->catdir(@initleftdircomps, $initleftfile), '', 'directory']);
+my ($initrightvol, $initrightdir, $initrightfile) = File::Spec->splitpath($dirright);
+my @initrightdircomps = File::Spec->splitdir($initrightdir);
+my @queueright = ([$dirright, $initrightvol, File::Spec->catdir(@initrightdircomps, $initrightfile), '', 'directory']);
+
+while (scalar(@queueleft) + scalar(@queueright) > 0) {
+  my ($pathleft, $volleft, $dirsleft, $fileleft, $typeleft);
+  my ($pathright, $volright, $dirsright, $fileright, $typeright);
+  my $leftonly = 0;
+  my $rightonly = 0;
+  if (scalar(@queueleft) > 0) {
+    ($pathleft, $volleft, $dirsleft, $fileleft, $typeleft) = @{$queueleft[$#queueleft]};
+  }
+  if (scalar(@queueright) > 0) {
+    ($pathright, $volright, $dirsright, $fileright, $typeright) = @{$queueright[$#queueright]};
+  }
+  if (!defined($fileleft)) {
+    $rightonly = 1;
+  } elsif (!defined($fileright)) {
+    $leftonly = 1;
+  } else {
+    my $cmpresult = $fileleft cmp $fileright;
+    if ($cmpresult < 0) {
+      $leftonly = 1;
+    } elsif ($cmpresult > 0) {
+      $rightonly = 1;
+    } elsif ($typeleft ne $typeright) {
+      if ($typeleft cmp $typeright < 0) {
+	$leftonly = 1;
+      } else {
+	$rightonly = 1;
+      }
+    }
+  }
+  if ($leftonly) {
+    $retval = 1;
+    print "Only in ${dirleft}: ${typeleft} " . substr($pathleft, length($dirleft) + 1) . "\n";
+    pop @queueleft;
+  } elsif ($rightonly) {
+    $retval = 1;
+    print "Only in ${dirright}: ${typeright} " . substr($pathright, length($dirright) + 1) . "\n";
+    pop @queueright;
+  } else {
+    pop @queueleft;
+    pop @queueright;
+    # typeleft and typeright are equal, and fileleft and fileright are equal
+    if ($typeleft eq 'file') {
+      if ($fileleft =~ /\.gz$/) {
+	my @gzipleft = `gzip -l --verbose '${pathleft}'`;
+	my @gzipfieldsleft = split(/\s+/, $gzipleft[1]);
+	my $crcleft = $gzipfieldsleft[1];
+	my @gzipright = `gzip -l --verbose '${pathright}'`;
+	my @gzipfieldsright = split(/\s+/, $gzipright[1]);
+	my $crcright = $gzipfieldsright[1];
+	if ($crcleft ne $crcright) {
+	  print STDOUT "Uncompressed contents of files ${pathleft} and ${pathright} differ (CRCs: $crcleft != $crcright).\n";
+	  $retval = 1;
+	}
+	next;
+      }
+      if ($fileleft =~ /\.nii$/) {
+	my $md5left = `cat '${pathleft}' | md5sum`;
+	my $md5right = `cat '${pathright}' | md5sum`;
+	if ($md5left ne $md5right) {
+	  print STDOUT "Contents of files ${pathleft} and ${pathright} differ.\n";
+	  $retval = 1;
+	}
+	next;
+      }
+      my $temppathleft = undef;
+      my $temppathright = undef;
+      if ($fileleft =~ /(\.bxh|\.xml)$/) {
+	# "canonicalize" files before diffing
+	open my $oldout, ">&STDOUT" or die "Can't dup STDOUT: $!\n";
+	my ($fh1, $fn1) = tempfile();
+	open STDOUT, ">&", $fh1 or die "Can't dup \$fh1: $!\n";
+	system(File::Spec->catpath('', $FindBin::Bin, 'bxhsig.pl'), '--printcanonical', $pathleft) == 0 or die "Error running bxhsig.pl: $?\n";
+	close $fh1;
+	close STDOUT;
+	my ($fh2, $fn2) = tempfile();
+	open STDOUT, ">&", $fh2 or die "Can't dup \$fh2: $!\n";
+	system(File::Spec->catpath('', $FindBin::Bin, 'bxhsig.pl'), '--printcanonical', $pathright) == 0 or die "Error running bxhsig.pl: $?\n";
+	close $fh2;
+	close STDOUT;
+	open STDOUT, ">&", $oldout or die "Error restoring STDOUT: $!\n";
+	$temppathleft = $fn1;
+	$temppathright = $fn2;
+      }
+      if (defined($temppathleft) && defined($temppathright)) {
+	open(FH, '-|', "diff -u '${temppathleft}' '${temppathright}'") || die "Error running diff: $!\n";
+      } else {
+	open(FH, '-|', "diff -u '${pathleft}' '${pathright}'") || die "Error running diff: $!\n";
+      }
+      my @diffoutput = <FH>;
+      my $closeret = close FH;
+      if (defined($temppathleft)) {
+	unlink $temppathleft;
+      }
+      if (defined($temppathright)) {
+	unlink $temppathright;
+      }
+      if (!$closeret) {
+	if ($! == 0) {
+	  if (defined($temppathleft) && defined($temppathright)) {
+	    @diffoutput = map { $_ =~ s/$temppathleft/$pathleft/g; $_ } @diffoutput;
+	    @diffoutput = map { $_ =~ s/$temppathright/$pathright/g; $_ } @diffoutput;
+	  }
+	  print STDOUT @diffoutput;
+	  $retval = 1;
+	} else {
+	  die "Error running diff: $!\n";
+	}
+      }
+    } elsif ($typeleft eq 'directory') {
+      {
+	opendir(DIRH, $pathleft) || die "Error opening directory ${pathleft}!\n";
+	my @files = grep { ! /^(\.|\.\.)$/ } readdir(DIRH);
+	closedir DIRH;
+	map {
+	  my $type = 'unknown';
+	  my $newdirs = File::Spec->catdir($dirsleft, $fileleft);
+	  my $path = File::Spec->catpath($volleft, $newdirs, $_);
+	  if (! grep { $path =~ /$_$/ } @opt_excludes) {
+	    if (-d $path) {
+	      $type = 'directory';
+	    } elsif (-f $path) {
+	      $type = 'file';
+	    }
+	    push @queueleft, [ $path, $volleft, $newdirs, $_, $type ];
+	  }
+	} sort { $b cmp $a } @files;
+      }
+      {
+	opendir(DIRH, $pathright) || die "Error opening directory ${pathright}!\n";
+	my @files = grep { ! /^(\.|\.\.)$/ } readdir(DIRH);
+	closedir DIRH;
+	map {
+	  my $type = 'unknown';
+	  my $newdirs = File::Spec->catdir($dirsright, $fileright);
+	  my $path = File::Spec->catpath($volright, $newdirs, $_);
+	  if (! grep { $path =~ /$_$/ } @opt_excludes) {
+	    if (-d $path) {
+	      $type = 'directory';
+	    } elsif (-f $path) {
+	      $type = 'file';
+	    }
+	    push @queueright, [ $path, $volright, $newdirs, $_, $type ];
+	  }
+	} sort { $b cmp $a } @files;
+      }
+    }
+  }
+}
+
