@@ -1,0 +1,6 @@
+No need to create a docker image yourself. Just download it from the dockerhub.
+
+https://hub.docker.com/repository/docker/diffdocker/fbirnqa
+
+Then create a singularity image.
+
