@@ -1,6 +1,7 @@
 Under Constructions!!!
 
-# fmri-fbirnqa
+# dbicqa - mri scanner stability QA based on fbirn tools
+
 In this repo, I'm going to make avalable the fbirn qa scripts (pipeline) and information about the docker/singulartiy container used to produce results shown in https://www.dartmouth.edu/dbic/research_infrastructure/qualityassurance.html
 
 
